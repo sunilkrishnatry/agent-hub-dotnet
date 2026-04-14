@@ -1,0 +1,6 @@
+@AgentHub.API_HostAddress = http://localhost:5023
+
+GET {{AgentHub.API_HostAddress}}/health
+Accept: application/json
+
+###
