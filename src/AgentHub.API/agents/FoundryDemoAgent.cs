@@ -30,6 +30,14 @@ public static class FoundryDemoAgent
         ValidateModelDeploymentName(settings.AzureAIModelDeploymentName);
 
         var record = await GetOrCreateAgentAsync(client, agentName, settings.AzureAIModelDeploymentName, logger);
+        if (!string.Equals(record.Name, agentName, StringComparison.OrdinalIgnoreCase))
+        {
+            logger.LogWarning(
+                "Foundry resolved agent name differs from configured value. ConfiguredAgentName={ConfiguredAgentName}, ResolvedAgentName={ResolvedAgentName}",
+                agentName,
+                record.Name);
+        }
+
         logger.LogInformation("Foundry agent is ready. AgentName={AgentName}", record.Name);
         return client.AsAIAgent(record);
     }
