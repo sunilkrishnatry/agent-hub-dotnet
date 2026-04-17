@@ -14,4 +14,9 @@
     <PackageReference Include="Swashbuckle.AspNetCore.SwaggerUI" Version="10.1.7" />
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\AgentHub.Persistence\AgentHub.Persistence.csproj" />
+    <ProjectReference Include="..\AgentHub.SessionState\AgentHub.SessionState.csproj" />
+  </ItemGroup>
+
 </Project>
