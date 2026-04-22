@@ -159,7 +159,7 @@ public static class AgentRoutes
             var agent = memoryContext.Agent;
             logger.LogDebug("Agent obtained from FoundryMemoryContext. AgentName={AgentName}", agent.GetType().Name);
 
-            var agentSession = await memoryContext.SessionCache.GetOrCreateSessionAsync(
+            var (agentSession, isNewSession) = await memoryContext.SessionCache.GetOrCreateSessionAsync(
                 request.UserId,
                 async () =>
                 {
@@ -167,52 +167,89 @@ public static class AgentRoutes
                     return await agent.CreateSessionAsync();
                 });
 
-            logger.LogDebug("Session ready for UserId={UserId}. Cache size={CacheSize} active users", 
-                request.UserId, memoryContext.SessionCache.GetActiveCacheSize());
+            logger.LogDebug("Session ready for UserId={UserId}. IsNew={IsNew}, Cache size={CacheSize} active users", 
+                request.UserId, isNewSession, memoryContext.SessionCache.GetActiveCacheSize());
 
-            logger.LogDebug("Running agent with message for UserId={UserId}", request.UserId);
-            var memoryPrompt = await SearchFoundryMemoryAsync(
-                memoryContext.MemoryClient,
-                memoryContext.MemoryStoreName,
-                memoryContext.OperationCache,
-                request.UserId,
-                request.Message,
-                logger,
-                cancellationToken);
+            // Build context messages: Foundry memory (first request only) + local turn history + current message
+            var contextMessages = new List<ChatMessage>();
+
+            if (isNewSession)
+            {
+                logger.LogDebug("New session for UserId={UserId}, searching Foundry memory for bootstrap context", request.UserId);
+                var memoryPrompt = await SearchFoundryMemoryAsync(
+                    memoryContext.MemoryClient,
+                    memoryContext.MemoryStoreName,
+                    memoryContext.OperationCache,
+                    request.UserId,
+                    request.Message,
+                    logger,
+                    cancellationToken);
+
+                if (!string.IsNullOrWhiteSpace(memoryPrompt))
+                {
+                    contextMessages.Add(new ChatMessage(ChatRole.System, memoryPrompt));
+                }
+            }
+            else
+            {
+                // Use local turn cache as conversation context (no Foundry search needed)
+                var cachedTurns = memoryContext.SessionCache.GetTurns(request.UserId);
+                if (cachedTurns.Count > 0)
+                {
+                    logger.LogDebug("Using {TurnCount} cached local turns as context for UserId={UserId}", cachedTurns.Count, request.UserId);
+                    foreach (var turn in cachedTurns)
+                    {
+                        contextMessages.Add(new ChatMessage(ChatRole.User, turn.UserMessage));
+                        contextMessages.Add(new ChatMessage(ChatRole.Assistant, turn.AssistantResponse));
+                    }
+                }
+            }
+
+            contextMessages.Add(new ChatMessage(ChatRole.User, request.Message));
 
             AgentResponse response;
-            if (string.IsNullOrWhiteSpace(memoryPrompt))
+            if (contextMessages.Count == 1)
             {
+                // Only the current user message, no extra context needed
                 response = await agent.RunAsync(request.Message, agentSession, cancellationToken: cancellationToken);
             }
             else
             {
-                var messages = new[]
-                {
-                    new ChatMessage(ChatRole.System, memoryPrompt),
-                    new ChatMessage(ChatRole.User, request.Message)
-                };
-                response = await agent.RunAsync(messages, agentSession, cancellationToken: cancellationToken);
+                response = await agent.RunAsync(contextMessages, agentSession, cancellationToken: cancellationToken);
             }
             logger.LogDebug("Agent execution completed. ResponseLength={ResponseLength}", response.ToString().Length);
 
-            await UpdateFoundryMemoryAsync(
-                memoryContext.MemoryClient,
-                memoryContext.MemoryStoreName,
-                memoryContext.OperationCache,
-                request.UserId,
-                request.Message,
-                response.ToString(),
-                logger,
-                cancellationToken);
+            // Cache the turn locally
+            var responseText = response.ToString();
+            memoryContext.SessionCache.AppendTurn(request.UserId, request.Message, responseText);
+
+            // Fire-and-forget: persist to Foundry memory without blocking the response
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await UpdateFoundryMemoryAsync(
+                        memoryContext.MemoryClient,
+                        memoryContext.MemoryStoreName,
+                        memoryContext.OperationCache,
+                        request.UserId,
+                        request.Message,
+                        responseText,
+                        logger,
+                        CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "Background Foundry memory update failed for UserId={UserId}", request.UserId);
+                }
+            });
 
             logger.LogInformation(
                 "Foundry memory agent response completed. UserId={UserId}, ResponseLength={ResponseLength}",
                 request.UserId,
-                response.ToString().Length);
-            logger.LogDebug("User {UserId} now has persistent context in Foundry memory store. Next request will reuse session.", request.UserId);
+                responseText.Length);
 
-            return Results.Ok(new MemoryAgentRunResult(request.UserId, response.ToString()));
+            return Results.Ok(new MemoryAgentRunResult(request.UserId, responseText));
         });
 
         app.MapGet("/conversations/{conversationId:guid}/history", async (

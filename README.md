@@ -68,21 +68,22 @@ This means the conversation can survive process restarts as long as PostgreSQL h
 
 1. On startup, the API resolves or creates a Foundry memory store (persists in Azure)
 2. On startup, the API resolves or creates a dedicated Foundry memory agent
-3. On startup, an in-memory session cache and an operation cache are initialized
+3. On startup, an in-memory session cache (with local turn buffer) and an operation cache are initialized
 4. Requests include `message` and `userId`
 5. The route checks the session cache for the `userId`:
-   - **Cache hit** — reuses the existing `AgentSession`, continuing the conversation thread
-   - **Cache miss** — creates a new `AgentSession`, caches it by `userId` for future requests
-6. **Search** — Before the agent runs, the route calls `SearchMemoriesAsync` using the V2 protocol to retrieve relevant memories scoped to the `userId`. Matched memories are injected as a system prompt so the agent can reference prior context.
-7. **Run** — The agent processes the user message (with or without memory context) and produces a response.
-8. **Update** — After the agent responds, the route calls `UpdateMemoriesAsync` with the user message and assistant response as separate V2 `InputItem` messages, allowing Foundry to update the user profile and chat summary.
+   - **Cache hit (returning user)** — reuses the existing `AgentSession`. Recent conversation turns (last 10) are read from the local turn buffer and used as context. **No Foundry memory search is performed** — this is the fast path.
+   - **Cache miss (first request or after restart)** — creates a new `AgentSession`, caches it, and performs a one-time `SearchMemoriesAsync` call to bootstrap long-term context from Foundry.
+6. **Run** — The agent processes the user message (with local turn history or Foundry memory context) and produces a response.
+7. **Local cache** — The user/assistant turn is appended to a bounded ring buffer (last 10 turns per user).
+8. **Fire-and-forget update** — The route returns the response immediately, then persists the turn to Foundry memory in the background without blocking. Failures are logged but do not affect the user response.
 9. Search and update operation IDs are tracked per `userId` in the operation cache so Foundry can chain incremental updates.
 
-**Two layers of persistence:**
+**Three layers of state:**
 
 | Layer | Scope | Survives app restart? | Backed by |
 |-------|-------|-----------------------|-----------|
 | Session cache | In-memory per `userId` | No | RAM (thread-safe `ConcurrentDictionary`) |
+| Local turn buffer | In-memory per `userId`, last 10 turns | No | RAM (bounded ring buffer) |
 | Operation cache | In-memory per `userId` | No | RAM (tracks search/update IDs for chaining) |
 | Foundry memory store | Long-term per `userId` | **Yes** | Azure AI Foundry |
 

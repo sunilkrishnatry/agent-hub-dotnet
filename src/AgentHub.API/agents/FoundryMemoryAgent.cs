@@ -21,7 +21,9 @@ namespace AgentHub.API.Agents;
 public sealed class FoundryMemorySessionCache
 {
     private readonly ConcurrentDictionary<string, AgentSession> _sessionCache = new();
+    private readonly ConcurrentDictionary<string, BoundedTurnBuffer> _turnCache = new();
     private readonly ILogger _logger;
+    private const int MaxTurnsPerUser = 10;
 
     public FoundryMemorySessionCache(ILogger logger)
     {
@@ -30,13 +32,14 @@ public sealed class FoundryMemorySessionCache
 
     /// <summary>
     /// Gets an existing session for userId or creates and caches a new one.
+    /// Returns (session, isNew) so the caller knows whether a Foundry memory search is needed.
     /// </summary>
-    public async Task<AgentSession> GetOrCreateSessionAsync(string userId, Func<Task<AgentSession>> sessionFactory)
+    public async Task<(AgentSession Session, bool IsNew)> GetOrCreateSessionAsync(string userId, Func<Task<AgentSession>> sessionFactory)
     {
         if (_sessionCache.TryGetValue(userId, out var cachedSession))
         {
             _logger.LogDebug("Reusing cached session for userId={UserId}", userId);
-            return cachedSession;
+            return (cachedSession, false);
         }
 
         _logger.LogDebug("Creating new session for userId={UserId} (not in cache)", userId);
@@ -49,18 +52,79 @@ public sealed class FoundryMemorySessionCache
         }
         else
         {
-            // Race condition: another thread added first, use that one
             _logger.LogDebug("Race condition detected for userId={UserId}, using cached session from other thread", userId);
-            return _sessionCache[userId];
+            return (_sessionCache[userId], false);
         }
 
-        return newSession;
+        return (newSession, true);
     }
 
     /// <summary>
-    /// Gets the count of active user sessions (for monitoring).
+    /// Appends a user/assistant turn to the bounded local cache for the given userId.
     /// </summary>
+    public void AppendTurn(string userId, string userMessage, string assistantResponse)
+    {
+        var buffer = _turnCache.GetOrAdd(userId, _ => new BoundedTurnBuffer(MaxTurnsPerUser));
+        buffer.Add(userMessage, assistantResponse);
+        _logger.LogDebug("Appended turn to local cache for userId={UserId}. TurnCount={TurnCount}", userId, buffer.Count);
+    }
+
+    /// <summary>
+    /// Returns the cached turns for the given userId (empty if no cache entry exists).
+    /// </summary>
+    public IReadOnlyList<ConversationTurn> GetTurns(string userId)
+    {
+        return _turnCache.TryGetValue(userId, out var buffer) ? buffer.GetTurns() : [];
+    }
+
     public int GetActiveCacheSize() => _sessionCache.Count;
+}
+
+/// <summary>
+/// A single user/assistant exchange.
+/// </summary>
+public sealed record ConversationTurn(string UserMessage, string AssistantResponse);
+
+/// <summary>
+/// Thread-safe bounded ring buffer that keeps the most recent N turns.
+/// </summary>
+public sealed class BoundedTurnBuffer
+{
+    private readonly ConversationTurn[] _buffer;
+    private int _head;
+    private int _count;
+    private readonly object _lock = new();
+
+    public BoundedTurnBuffer(int capacity)
+    {
+        _buffer = new ConversationTurn[capacity];
+    }
+
+    public int Count { get { lock (_lock) { return _count; } } }
+
+    public void Add(string userMessage, string assistantResponse)
+    {
+        lock (_lock)
+        {
+            _buffer[_head] = new ConversationTurn(userMessage, assistantResponse);
+            _head = (_head + 1) % _buffer.Length;
+            if (_count < _buffer.Length) _count++;
+        }
+    }
+
+    public IReadOnlyList<ConversationTurn> GetTurns()
+    {
+        lock (_lock)
+        {
+            var result = new ConversationTurn[_count];
+            var start = _count < _buffer.Length ? 0 : _head;
+            for (var i = 0; i < _count; i++)
+            {
+                result[i] = _buffer[(start + i) % _buffer.Length];
+            }
+            return result;
+        }
+    }
 }
 
 /// <summary>
