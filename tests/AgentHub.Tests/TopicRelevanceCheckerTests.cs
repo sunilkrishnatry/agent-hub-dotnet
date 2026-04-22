@@ -85,7 +85,8 @@ public class TopicRelevanceCheckerTests
     public void ComputeSimilarity_IdenticalText_ReturnsHigh()
     {
         var turns = new[] { new ConversationTurn("motor temperature threshold", "the threshold is 85 degrees") };
-        var score = TopicRelevanceChecker.ComputeSimilarity("motor temperature threshold", turns);
+        var (score, method) = TopicRelevanceChecker.ComputeSimilarity("motor temperature threshold", turns);
+        Assert.Equal("tfidf", method);
         // TF-IDF dilutes because the assistant response adds extra tokens to the turn vector
         Assert.True(score > 0.5, $"Expected > 0.5 but got {score:F3}");
     }
@@ -100,7 +101,7 @@ public class TopicRelevanceCheckerTests
                 "Motor temperature alerts for zone 3 have been configured with a threshold of 90°C.")
         };
 
-        var score = TopicRelevanceChecker.ComputeSimilarity(
+        var (score, _) = TopicRelevanceChecker.ComputeSimilarity(
             "What circuit breaker models are compatible with panel XR400?", turns);
         Assert.True(score < 0.1, $"Expected < 0.1 but got {score:F3}");
     }
@@ -108,22 +109,22 @@ public class TopicRelevanceCheckerTests
     [Fact]
     public void ComputeSimilarity_EmptyTurns_ReturnsZero()
     {
-        var score = TopicRelevanceChecker.ComputeSimilarity("anything", []);
+        var (score, method) = TopicRelevanceChecker.ComputeSimilarity("anything", []);
         Assert.Equal(0.0, score);
+        Assert.Equal("none", method);
     }
 
     [Fact]
     public void ComputeSimilarity_EmptyQuery_ReturnsZero()
     {
         var turns = new[] { new ConversationTurn("hello", "hi") };
-        var score = TopicRelevanceChecker.ComputeSimilarity("", turns);
+        var (score, _) = TopicRelevanceChecker.ComputeSimilarity("", turns);
         Assert.Equal(0.0, score);
     }
 
     [Fact]
     public void IsOnTopic_RespectsMaxTurnsToCompare()
     {
-        // Old turns about motors, recent turns about firmware
         var turns = new[]
         {
             new ConversationTurn("motor temperature threshold", "85 degrees celsius"),
@@ -133,8 +134,7 @@ public class TopicRelevanceCheckerTests
             new ConversationTurn("firmware rollback steps", "to rollback firmware use the recovery menu"),
         };
 
-        // Query about firmware should match recent turns (maxTurnsToCompare=3 picks the last 3)
-        var result = TopicRelevanceChecker.IsOnTopic("How to schedule firmware updates?", turns, maxTurnsToCompare: 3);
+        var result = TopicRelevanceChecker.IsOnTopic("How to schedule firmware updates?", turns, queryEmbedding: null, maxTurnsToCompare: 3);
         Assert.True(result);
     }
 
@@ -190,5 +190,115 @@ public class TopicRelevanceCheckerTests
         var turns = new[] { new ConversationTurn("motor temperature", "85 degrees") };
         var result = TopicRelevanceChecker.IsOnTopic("is it the one?", turns);
         Assert.False(result);
+    }
+
+    // --- Embedding-based tests (using synthetic vectors, no ONNX model required) ---
+
+    [Fact]
+    public void IsOnTopic_WithEmbeddings_SimilarVectors_ReturnsTrue()
+    {
+        var queryEmbedding = new float[] { 1.0f, 0.0f, 0.0f, 0.0f };
+        var turns = new[]
+        {
+            new ConversationTurn("motor temp", "85 degrees") { Embedding = new float[] { 0.95f, 0.1f, 0.0f, 0.0f } }
+        };
+
+        var result = TopicRelevanceChecker.IsOnTopic("motor alerts", turns, queryEmbedding);
+        Assert.True(result);
+    }
+
+    [Fact]
+    public void IsOnTopic_WithEmbeddings_DissimilarVectors_ReturnsFalse()
+    {
+        var queryEmbedding = new float[] { 1.0f, 0.0f, 0.0f, 0.0f };
+        var turns = new[]
+        {
+            new ConversationTurn("firmware update", "download from portal") { Embedding = new float[] { 0.0f, 0.0f, 1.0f, 0.0f } }
+        };
+
+        var result = TopicRelevanceChecker.IsOnTopic("motor alerts", turns, queryEmbedding);
+        Assert.False(result);
+    }
+
+    [Fact]
+    public void IsOnTopic_WithEmbeddings_UsesMaxSimilarityAcrossTurns()
+    {
+        var queryEmbedding = new float[] { 1.0f, 0.0f, 0.0f, 0.0f };
+        var turns = new[]
+        {
+            // Dissimilar turn
+            new ConversationTurn("firmware", "update") { Embedding = new float[] { 0.0f, 0.0f, 1.0f, 0.0f } },
+            // Similar turn
+            new ConversationTurn("motor temp", "85 degrees") { Embedding = new float[] { 0.98f, 0.05f, 0.0f, 0.0f } }
+        };
+
+        // Should be on-topic because at least one turn is similar
+        var result = TopicRelevanceChecker.IsOnTopic("motor alerts", turns, queryEmbedding);
+        Assert.True(result);
+    }
+
+    [Fact]
+    public void IsOnTopic_WithEmbeddings_FallsBackToTfIdfWhenNoTurnEmbeddings()
+    {
+        var queryEmbedding = new float[] { 1.0f, 0.0f, 0.0f, 0.0f };
+        // Turns without embeddings — should fall back to TF-IDF
+        var turns = new[]
+        {
+            new ConversationTurn("motor temperature threshold", "The motor temperature threshold is typically 85 degrees.")
+        };
+
+        // queryEmbedding is provided but turns have no embeddings → falls back to TF-IDF
+        var result = TopicRelevanceChecker.IsOnTopic("How do I configure motor temperature alerts?", turns, queryEmbedding);
+        Assert.True(result); // TF-IDF should match on "motor" and "temperature"
+    }
+
+    [Fact]
+    public void ComputeSimilarity_WithEmbeddings_ReturnsEmbeddingMethod()
+    {
+        var queryEmbedding = new float[] { 1.0f, 0.0f, 0.0f };
+        var turns = new[]
+        {
+            new ConversationTurn("test", "response") { Embedding = new float[] { 0.9f, 0.1f, 0.0f } }
+        };
+
+        var (score, method) = TopicRelevanceChecker.ComputeSimilarity("test", turns, queryEmbedding);
+        Assert.Equal("embedding", method);
+        Assert.True(score > 0.9);
+    }
+
+    [Fact]
+    public void EmbeddingCosineSimilarity_IdenticalVectors_ReturnsOne()
+    {
+        var a = new float[] { 1.0f, 0.0f, 0.0f };
+        var b = new float[] { 1.0f, 0.0f, 0.0f };
+        var similarity = TopicRelevanceChecker.EmbeddingCosineSimilarity(a, b);
+        Assert.Equal(1.0, similarity, precision: 5);
+    }
+
+    [Fact]
+    public void EmbeddingCosineSimilarity_OrthogonalVectors_ReturnsZero()
+    {
+        var a = new float[] { 1.0f, 0.0f, 0.0f };
+        var b = new float[] { 0.0f, 1.0f, 0.0f };
+        var similarity = TopicRelevanceChecker.EmbeddingCosineSimilarity(a, b);
+        Assert.Equal(0.0, similarity, precision: 5);
+    }
+
+    [Fact]
+    public void EmbeddingCosineSimilarity_OppositeVectors_ReturnsNegativeOne()
+    {
+        var a = new float[] { 1.0f, 0.0f, 0.0f };
+        var b = new float[] { -1.0f, 0.0f, 0.0f };
+        var similarity = TopicRelevanceChecker.EmbeddingCosineSimilarity(a, b);
+        Assert.Equal(-1.0, similarity, precision: 5);
+    }
+
+    [Fact]
+    public void EmbeddingCosineSimilarity_DifferentLengths_ReturnsZero()
+    {
+        var a = new float[] { 1.0f, 0.0f };
+        var b = new float[] { 1.0f, 0.0f, 0.0f };
+        var similarity = TopicRelevanceChecker.EmbeddingCosineSimilarity(a, b);
+        Assert.Equal(0.0, similarity);
     }
 }

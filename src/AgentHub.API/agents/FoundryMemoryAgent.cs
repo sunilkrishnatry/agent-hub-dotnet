@@ -62,10 +62,10 @@ public sealed class FoundryMemorySessionCache
     /// <summary>
     /// Appends a user/assistant turn to the bounded local cache for the given userId.
     /// </summary>
-    public void AppendTurn(string userId, string userMessage, string assistantResponse)
+    public void AppendTurn(string userId, string userMessage, string assistantResponse, float[]? embedding = null)
     {
         var buffer = _turnCache.GetOrAdd(userId, _ => new BoundedTurnBuffer(MaxTurnsPerUser));
-        buffer.Add(userMessage, assistantResponse);
+        buffer.Add(userMessage, assistantResponse, embedding);
         _logger.LogDebug("Appended turn to local cache for userId={UserId}. TurnCount={TurnCount}", userId, buffer.Count);
     }
 
@@ -81,9 +81,12 @@ public sealed class FoundryMemorySessionCache
 }
 
 /// <summary>
-/// A single user/assistant exchange.
+/// A single user/assistant exchange, optionally with a precomputed embedding for semantic comparison.
 /// </summary>
-public sealed record ConversationTurn(string UserMessage, string AssistantResponse);
+public sealed record ConversationTurn(string UserMessage, string AssistantResponse)
+{
+    public float[]? Embedding { get; init; }
+}
 
 /// <summary>
 /// Thread-safe bounded ring buffer that keeps the most recent N turns.
@@ -102,11 +105,11 @@ public sealed class BoundedTurnBuffer
 
     public int Count { get { lock (_lock) { return _count; } } }
 
-    public void Add(string userMessage, string assistantResponse)
+    public void Add(string userMessage, string assistantResponse, float[]? embedding = null)
     {
         lock (_lock)
         {
-            _buffer[_head] = new ConversationTurn(userMessage, assistantResponse);
+            _buffer[_head] = new ConversationTurn(userMessage, assistantResponse) { Embedding = embedding };
             _head = (_head + 1) % _buffer.Length;
             if (_count < _buffer.Length) _count++;
         }
@@ -138,6 +141,7 @@ public sealed class FoundryMemoryContext
     public required string MemoryStoreName { get; init; }
     public required FoundryMemorySessionCache SessionCache { get; init; }
     public required FoundryMemoryOperationCache OperationCache { get; init; }
+    public LocalEmbeddingService? EmbeddingService { get; init; }
 }
 
 public sealed class FoundryMemoryOperationCache
@@ -202,13 +206,16 @@ public static class FoundryMemoryAgent
         var operationCache = new FoundryMemoryOperationCache();
         logger.LogDebug("In-memory session cache initialized (thread-safe, keyed by userId)");
 
+        var embeddingService = LocalEmbeddingService.TryCreate(settings.LocalEmbeddingModelPath, logger);
+
         return new FoundryMemoryContext
         {
             Agent = client.AsAIAgent(record),
             MemoryClient = memoryClient,
             MemoryStoreName = settings.MemoryStoreName,
             SessionCache = sessionCache,
-            OperationCache = operationCache
+            OperationCache = operationCache,
+            EmbeddingService = embeddingService
         };
     }
 

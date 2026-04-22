@@ -70,11 +70,14 @@ This means the conversation can survive process restarts as long as PostgreSQL h
 2. On startup, the API resolves or creates a dedicated Foundry memory agent
 3. On startup, an in-memory session cache (with local turn buffer) and an operation cache are initialized
 4. Requests include `message` and `userId`
-5. The route checks the session cache for the `userId`:
-   - **Cache hit (returning user)** — reuses the existing `AgentSession`. Recent conversation turns (last 10) are read from the local turn buffer and used as context. **No Foundry memory search is performed** — this is the fast path.
-   - **Cache miss (first request or after restart)** — creates a new `AgentSession`, caches it, and performs a one-time `SearchMemoriesAsync` call to bootstrap long-term context from Foundry.
+5. The route computes a local embedding for the incoming message
+6. The route checks the session cache for the `userId`:
+   - **Cache hit (returning user)** — reuses the existing `AgentSession` and compares the message embedding to recent cached turns using the local `TopicRelevanceChecker` (embedding-based with TF-IDF fallback).
+     - **On-topic continuation** — uses only local turn history as context (~5-10ms topic check, **no Foundry memory search**)
+     - **Topic shift detected** — performs a `SearchMemoriesAsync` call to bootstrap long-term context from Foundry
+   - **Cache miss (first request or after restart)** — creates a new `AgentSession`, caches it, and performs a one-time `SearchMemoriesAsync` call to bootstrap long-term context from Foundry
 6. **Run** — The agent processes the user message (with local turn history or Foundry memory context) and produces a response.
-7. **Local cache** — The user/assistant turn is appended to a bounded ring buffer (last 10 turns per user).
+7. **Local cache with embeddings** — The user/assistant turn is appended to a bounded ring buffer (last 20 turns per user), with computed embedding vectors stored alongside for future topic detection.
 8. **Fire-and-forget update** — The route returns the response immediately, then persists the turn to Foundry memory in the background without blocking. Failures are logged but do not affect the user response.
 9. Search and update operation IDs are tracked per `userId` in the operation cache so Foundry can chain incremental updates.
 
@@ -83,13 +86,39 @@ This means the conversation can survive process restarts as long as PostgreSQL h
 | Layer | Scope | Survives app restart? | Backed by |
 |-------|-------|-----------------------|-----------|
 | Session cache | In-memory per `userId` | No | RAM (thread-safe `ConcurrentDictionary`) |
-| Local turn buffer | In-memory per `userId`, last 10 turns | No | RAM (bounded ring buffer) |
+| Local turn buffer | In-memory per `userId`, last 20 turns with embeddings | No | RAM (bounded ring buffer + embedding vectors) |
 | Operation cache | In-memory per `userId` | No | RAM (tracks search/update IDs for chaining) |
 | Foundry memory store | Long-term per `userId` | **Yes** | Azure AI Foundry |
 
 When the app restarts, the session cache is cleared. However, Foundry's memory store retains long-term context (user profile, chat summaries) from all previous sessions and makes it available to the agent on the next request.
 
 This path does not use the PostgreSQL conversation pipeline.
+
+## Topic Shift Detection
+
+The `foundryMemoryAgent` route includes intelligent topic shift detection to optimize memory access:
+
+**Fast path (on-topic continuation):**
+- User sends a message related to recent conversation history
+- Local `TopicRelevanceChecker` compares the message to the last 5 cached turns using semantic similarity
+- **No Foundry memory search** — uses only the fast in-memory turn buffer (~5-10ms)
+
+**Memory refresh path (topic shift detected):**
+- User sends a message unrelated to recent turns
+- Topic checker detects the shift and triggers a `SearchMemoriesAsync` call
+- Foundry memory is searched for broader context on the new topic
+- Relevant long-term context is injected before the agent generates a response
+
+**Semantic similarity engine:**
+- **Primary:** Local ONNX embedding inference using all-MiniLM-L6-v2 (~384-dim vectors, ~5-10ms per embedding)
+  - Compares message embedding against recent turn embeddings using cosine similarity (threshold 0.5)
+  - Runs entirely in-process — no network latency
+  - SIMD-optimized via `TensorPrimitives.CosineSimilarity`
+- **Fallback:** TF-IDF bag-of-words similarity (threshold 0.15)
+  - Used when local embedding model is unavailable
+  - Provides compatibility and robustness
+
+This hybrid approach balances semantic accuracy (embeddings) with reliability (TF-IDF fallback) while keeping the fast path truly local.
 
 ## Prerequisites
 
@@ -98,6 +127,10 @@ This path does not use the PostgreSQL conversation pipeline.
 - Azure sign-in available to `DefaultAzureCredential` such as `az login`
 - A PostgreSQL server reachable from the API
 - For `foundryMemoryAgent`: the Foundry project's managed identity must have the **Cognitive Services OpenAI User** role on the Azure OpenAI resource hosting the `text-embedding-3-small` deployment
+- (Optional) For local topic shift detection: ONNX model files (all-MiniLM-L6-v2 or compatible)
+  - Model directory must contain `model.onnx` and `vocab.txt`
+  - Download from [HuggingFace](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) (~80MB)
+  - If not provided, topic detection falls back to TF-IDF (slower but always available)
 
 ## Configuration
 
@@ -118,6 +151,7 @@ The application uses the `AgentHub` configuration section.
 | `AgentHub:FoundryAgentName` | No | Name of the Foundry-managed agent; defaults to `DemoAgent` when omitted |
 | `AgentHub:MemoryStoreName` | No | Foundry memory store name for `foundryMemoryAgent`; defaults to `agent-hub-memory` |
 | `AgentHub:MemoryEmbeddingModel` | No | Embedding deployment/model for Foundry memory store; defaults to `text-embedding-3-small` |
+| `AgentHub:LocalEmbeddingModelPath` | No | Path to local ONNX embedding model (for topic shift detection); if omitted, uses TF-IDF fallback |
 
 ### PostgreSQL Settings
 
@@ -147,6 +181,7 @@ Environment variable fallbacks are also supported:
 - `AZURE_AI_FOUNDRY_AGENT_NAME`
 - `AZURE_AI_MEMORY_STORE_NAME`
 - `AZURE_AI_MEMORY_EMBEDDING_MODEL`
+- `LOCAL_EMBEDDING_MODEL_PATH`
 - `POSTGRES_CONNECTION_STRING`
 - `POSTGRES_URL`
 - `POSTGRES_HOST`
@@ -175,6 +210,7 @@ Use placeholder values similar to the following in `src/AgentHub.API/appsettings
     "FoundryAgentName": "foundry-demo-agent",
     "MemoryStoreName": "agent-hub-memory",
     "MemoryEmbeddingModel": "text-embedding-3-small",
+    "LocalEmbeddingModelPath": "./models/all-MiniLM-L6-v2",
     "Postgres": {
       "Host": "<server>.postgres.database.azure.com",
       "Port": "5432",

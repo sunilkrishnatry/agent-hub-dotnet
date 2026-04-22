@@ -107,12 +107,14 @@ sequenceDiagram
 
 ---
 
-## 3. `/agents/foundryMemoryAgent` — Foundry Memory Store with Local Turn Cache
+## 3. `/agents/foundryMemoryAgent` — Foundry Memory Store with Local Topic Detection
 
 ```mermaid
 sequenceDiagram
     participant Client
     participant Route as POST /agents/foundryMemoryAgent
+    participant EmbedSvc as LocalEmbeddingService<br/>(ONNX inference, ~5-10ms)
+    participant TopicChk as TopicRelevanceChecker<br/>(embedding + TF-IDF fallback)
     participant Cache as FoundryMemorySessionCache<br/>(sessions + local turn buffer, keyed by userId)
     participant OpCache as FoundryMemoryOperationCache<br/>(tracks search/update IDs)
     participant Agent as AIAgent<br/>(memory-enabled Foundry agent)
@@ -123,14 +125,41 @@ sequenceDiagram
 
     Client->>Route: POST {message, userId}
 
+    Note over Route,TopicChk: Compute local embedding for topic detection (no network call)
+    Route->>EmbedSvc: Embed(message)
+    alt ONNX model available
+        EmbedSvc-->>Route: normalized float[] embedding (~5-10ms in-process)
+    else model not available
+        EmbedSvc-->>Route: null (will use TF-IDF fallback)
+    end
+
     alt userId has a cached session (returning user)
         Route->>Cache: GetOrCreateSessionAsync(userId)
         Cache-->>Route: (existing AgentSession, isNew=false)
-        Note over Cache: Cache HIT — skip Foundry memory search
+        Note over Cache: Cache HIT
 
         Route->>Cache: GetTurns(userId)
-        Cache-->>Route: last 10 turns (local buffer)
-        Note over Route: Build context: [cached turns as user/assistant messages] + current message
+        Cache-->>Route: last 5 turns (local buffer)
+        
+        Note over Route,TopicChk: Check if message is on-topic using local embedding + TF-IDF fallback
+        Route->>TopicChk: IsOnTopic(message, cachedTurns, queryEmbedding)
+        TopicChk-->>Route: isOnTopic (true/false)
+        
+        alt isOnTopic (message is related to recent turns)
+            Note over Route: Fast path — use only local turn history
+            Note over Route: Build context: [cached turns as user/assistant messages] + current message
+        else topic shift detected
+            Note over Route: Slow path — refresh memory from Foundry
+            Route->>OpCache: GetPreviousSearchId(userId)
+            OpCache-->>Route: previousSearchId (or null)
+            Route->>MemoryAPI: SearchMemoriesAsync(storeName, V2 protocol request)
+            Note over MemoryAPI: V2 JSON: {scope, items: [{type: "message", role: "user", content: message}], previous_search_id, options}
+            MemoryAPI->>Foundry: Search memories (embedding via text-embedding-3-small)
+            Foundry-->>MemoryAPI: MemoryStoreSearchResponse (memories + searchId)
+            MemoryAPI-->>Route: matched memories
+            Route->>OpCache: RememberSearchId(userId, searchId)
+            Note over Route: Build context: [Foundry memory] + [cached turns] + current message
+        end
     else no session for this userId (first request or after restart)
         Route->>Cache: GetOrCreateSessionAsync(userId)
         Cache->>Agent: CreateSessionAsync()
@@ -138,7 +167,7 @@ sequenceDiagram
         Foundry-->>Agent: session
         Agent-->>Cache: new AgentSession
         Cache-->>Route: (new AgentSession, isNew=true)
-        Note over Cache: Cache MISS — search Foundry for long-term context
+        Note over Cache: Cache MISS — search Foundry for bootstrap context (first request)
 
         Route->>OpCache: GetPreviousSearchId(userId)
         OpCache-->>Route: previousSearchId (or null)
@@ -157,8 +186,8 @@ sequenceDiagram
     Foundry-->>Agent: Response
     Agent-->>Route: AgentResponse
 
-    Note over Route,Cache: Cache the turn locally (bounded to last 10)
-    Route->>Cache: AppendTurn(userId, message, response)
+    Note over Route,Cache: Cache the turn locally with embedding (bounded to last 20)
+    Route->>Cache: AppendTurn(userId, message, response, queryEmbedding)
 
     Route-->>Client: 200 OK {userId, response}
 
@@ -169,6 +198,6 @@ sequenceDiagram
     Foundry-->>MemoryAPI: MemoryUpdateResult (updateId + status)
     MemoryAPI-->>OpCache: RememberUpdateId(userId, updateId)
 
-    Note over Cache: Session + local turns remain cached (survives future requests within process)
+    Note over Cache: Session + local turns remain cached with embeddings (survives future requests within process)
     Note over MemoryAPI: Long-term user context persisted in Azure (survives app restart)
 ```

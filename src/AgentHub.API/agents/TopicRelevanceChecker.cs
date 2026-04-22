@@ -1,16 +1,17 @@
+using System.Numerics.Tensors;
 using System.Text.RegularExpressions;
 
 namespace AgentHub.API.Agents;
 
 /// <summary>
-/// Performs local semantic similarity checks using TF-IDF cosine similarity.
-/// No network calls — runs entirely in-process using only BCL types.
-/// Used to detect topic shifts: if the user's query is not similar to recent cached turns,
-/// fall back to Foundry memory search for broader context.
+/// Performs local topic relevance checks to detect topic shifts.
+/// Uses ONNX embedding cosine similarity when available, TF-IDF fallback otherwise.
+/// No network calls — runs entirely in-process.
 /// </summary>
 internal static partial class TopicRelevanceChecker
 {
-    private const double DefaultThreshold = 0.15;
+    private const double DefaultEmbeddingThreshold = 0.5;
+    private const double DefaultTfIdfThreshold = 0.15;
 
     private static readonly HashSet<string> StopWords = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -34,58 +35,114 @@ internal static partial class TopicRelevanceChecker
 
     /// <summary>
     /// Returns true if the query is relevant to recent conversation turns (on-topic).
-    /// Returns false if the query appears to be a topic shift, signaling that a
-    /// Foundry memory search should be performed for broader context.
+    /// Uses embedding cosine similarity when queryEmbedding and turn embeddings are available.
+    /// Falls back to TF-IDF when embeddings are not available.
     /// </summary>
-    /// <param name="query">The current user message.</param>
-    /// <param name="recentTurns">Recent conversation turns from the local cache.</param>
-    /// <param name="maxTurnsToCompare">How many recent turns to compare against (from the end).</param>
-    /// <param name="threshold">Cosine similarity threshold. Below this = topic shift.</param>
-    /// <returns>true if on-topic; false if topic shift detected.</returns>
     internal static bool IsOnTopic(
         string query,
         IReadOnlyList<ConversationTurn> recentTurns,
+        float[]? queryEmbedding = null,
         int maxTurnsToCompare = 5,
-        double threshold = DefaultThreshold)
+        double? threshold = null)
     {
         if (recentTurns.Count == 0)
             return false;
 
-        var queryTokens = Tokenize(query);
-        if (queryTokens.Count == 0)
-            return false;
+        // Try embedding-based comparison first
+        if (queryEmbedding != null)
+        {
+            var turnsWithEmbeddings = recentTurns
+                .TakeLast(maxTurnsToCompare)
+                .Where(t => t.Embedding != null)
+                .ToList();
 
-        // Build a combined document from recent turns (both user messages and assistant responses)
-        var turnsToCheck = recentTurns.Count <= maxTurnsToCompare
-            ? recentTurns
-            : recentTurns.Skip(recentTurns.Count - maxTurnsToCompare).ToList();
+            if (turnsWithEmbeddings.Count > 0)
+            {
+                var maxSimilarity = turnsWithEmbeddings
+                    .Max(t => EmbeddingCosineSimilarity(queryEmbedding, t.Embedding!));
+                return maxSimilarity >= (threshold ?? DefaultEmbeddingThreshold);
+            }
+        }
 
-        var recentText = string.Join(" ",
-            turnsToCheck.SelectMany(t => new[] { t.UserMessage, t.AssistantResponse }));
-        var recentTokens = Tokenize(recentText);
-
-        if (recentTokens.Count == 0)
-            return false;
-
-        var similarity = CosineSimilarity(
-            BuildTfVector(queryTokens),
-            BuildTfVector(recentTokens));
-
-        return similarity >= threshold;
+        // TF-IDF fallback
+        return IsOnTopicTfIdf(query, recentTurns, maxTurnsToCompare, threshold ?? DefaultTfIdfThreshold);
     }
 
     /// <summary>
-    /// Computes the cosine similarity score without making a relevance decision.
-    /// Useful for logging and diagnostics.
+    /// Computes the similarity score for logging/diagnostics.
+    /// Returns the embedding-based score when available, TF-IDF score otherwise.
     /// </summary>
-    internal static double ComputeSimilarity(
+    internal static (double Similarity, string Method) ComputeSimilarity(
         string query,
         IReadOnlyList<ConversationTurn> recentTurns,
+        float[]? queryEmbedding = null,
         int maxTurnsToCompare = 5)
     {
         if (recentTurns.Count == 0)
+            return (0.0, "none");
+
+        // Try embedding-based
+        if (queryEmbedding != null)
+        {
+            var turnsWithEmbeddings = recentTurns
+                .TakeLast(maxTurnsToCompare)
+                .Where(t => t.Embedding != null)
+                .ToList();
+
+            if (turnsWithEmbeddings.Count > 0)
+            {
+                var maxSimilarity = turnsWithEmbeddings
+                    .Max(t => EmbeddingCosineSimilarity(queryEmbedding, t.Embedding!));
+                return (maxSimilarity, "embedding");
+            }
+        }
+
+        // TF-IDF fallback
+        return (ComputeTfIdfSimilarity(query, recentTurns, maxTurnsToCompare), "tfidf");
+    }
+
+    /// <summary>
+    /// Cosine similarity between two embedding vectors. SIMD-optimized via TensorPrimitives.
+    /// </summary>
+    internal static double EmbeddingCosineSimilarity(ReadOnlySpan<float> a, ReadOnlySpan<float> b)
+    {
+        if (a.Length != b.Length || a.Length == 0)
             return 0.0;
 
+        return TensorPrimitives.CosineSimilarity(a, b);
+    }
+
+    // --- TF-IDF fallback methods ---
+
+    internal static bool IsOnTopicTfIdf(
+        string query,
+        IReadOnlyList<ConversationTurn> recentTurns,
+        int maxTurnsToCompare = 5,
+        double threshold = DefaultTfIdfThreshold)
+    {
+        var queryTokens = Tokenize(query);
+        if (queryTokens.Count == 0)
+            return false;
+
+        var turnsToCheck = recentTurns.Count <= maxTurnsToCompare
+            ? recentTurns
+            : recentTurns.Skip(recentTurns.Count - maxTurnsToCompare).ToList();
+
+        var recentText = string.Join(" ",
+            turnsToCheck.SelectMany(t => new[] { t.UserMessage, t.AssistantResponse }));
+        var recentTokens = Tokenize(recentText);
+
+        if (recentTokens.Count == 0)
+            return false;
+
+        return TfIdfCosineSimilarity(BuildTfVector(queryTokens), BuildTfVector(recentTokens)) >= threshold;
+    }
+
+    private static double ComputeTfIdfSimilarity(
+        string query,
+        IReadOnlyList<ConversationTurn> recentTurns,
+        int maxTurnsToCompare)
+    {
         var queryTokens = Tokenize(query);
         if (queryTokens.Count == 0)
             return 0.0;
@@ -101,9 +158,7 @@ internal static partial class TopicRelevanceChecker
         if (recentTokens.Count == 0)
             return 0.0;
 
-        return CosineSimilarity(
-            BuildTfVector(queryTokens),
-            BuildTfVector(recentTokens));
+        return TfIdfCosineSimilarity(BuildTfVector(queryTokens), BuildTfVector(recentTokens));
     }
 
     internal static List<string> Tokenize(string text)
@@ -133,7 +188,7 @@ internal static partial class TopicRelevanceChecker
         return tf;
     }
 
-    private static double CosineSimilarity(Dictionary<string, double> a, Dictionary<string, double> b)
+    private static double TfIdfCosineSimilarity(Dictionary<string, double> a, Dictionary<string, double> b)
     {
         var dotProduct = 0.0;
         var normA = 0.0;

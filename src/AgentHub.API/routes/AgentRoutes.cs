@@ -189,6 +189,17 @@ public static partial class AgentRoutes
             // Build context messages: Foundry memory (first request only) + local turn history + current message
             var contextMessages = new List<ChatMessage>();
 
+            // Compute local embedding for the current message (no network call, ~5-10ms)
+            float[]? queryEmbedding = null;
+            try
+            {
+                queryEmbedding = memoryContext.EmbeddingService?.Embed(request.Message);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Local embedding failed for UserId={UserId}. Falling back to TF-IDF.", request.UserId);
+            }
+
             if (isNewSession)
             {
                 logger.LogInformation("New session for UserId={UserId}. Searching Foundry memory store for bootstrap context (fire-and-forget updates from prior session may still be indexing).", request.UserId);
@@ -209,19 +220,19 @@ public static partial class AgentRoutes
             else
             {
                 var cachedTurns = memoryContext.SessionCache.GetTurns(request.UserId);
-                var similarity = TopicRelevanceChecker.ComputeSimilarity(request.Message, cachedTurns);
-                var isOnTopic = TopicRelevanceChecker.IsOnTopic(request.Message, cachedTurns);
+                var (similarity, method) = TopicRelevanceChecker.ComputeSimilarity(request.Message, cachedTurns, queryEmbedding);
+                var isOnTopic = TopicRelevanceChecker.IsOnTopic(request.Message, cachedTurns, queryEmbedding);
 
                 logger.LogDebug(
-                    "Topic relevance check for UserId={UserId}. Similarity={Similarity:F3}, OnTopic={OnTopic}, CachedTurns={TurnCount}",
-                    request.UserId, similarity, isOnTopic, cachedTurns.Count);
+                    "Topic relevance check for UserId={UserId}. Similarity={Similarity:F3}, Method={Method}, OnTopic={OnTopic}, CachedTurns={TurnCount}",
+                    request.UserId, similarity, method, isOnTopic, cachedTurns.Count);
 
                 if (!isOnTopic && cachedTurns.Count > 0)
                 {
                     // Topic shift detected — supplement local cache with Foundry memory search
                     logger.LogInformation(
-                        "Topic shift detected for UserId={UserId} (similarity={Similarity:F3}). Searching Foundry memory for broader context.",
-                        request.UserId, similarity);
+                        "Topic shift detected for UserId={UserId} (similarity={Similarity:F3}, method={Method}). Searching Foundry memory for broader context.",
+                        request.UserId, similarity, method);
 
                     var memoryPrompt = await SearchFoundryMemoryAsync(
                         memoryContext.MemoryClient,
@@ -264,9 +275,9 @@ public static partial class AgentRoutes
             }
             logger.LogDebug("Agent execution completed. ResponseLength={ResponseLength}", response.ToString().Length);
 
-            // Cache the turn locally
+            // Cache the turn locally (with embedding for future semantic comparison)
             var responseText = response.ToString();
-            memoryContext.SessionCache.AppendTurn(request.UserId, request.Message, responseText);
+            memoryContext.SessionCache.AppendTurn(request.UserId, request.Message, responseText, queryEmbedding);
 
             // Fire-and-forget: persist to Foundry memory without blocking the response
             _ = Task.Run(async () =>
