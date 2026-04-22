@@ -8,6 +8,8 @@ public class Settings
     public required Uri AzureAIProjectEndpoint { get; init; }
     public string AzureAIModelDeploymentName { get; init; } = "gpt-4o-mini";
     public string? FoundryAgentName { get; init; }
+    public string MemoryStoreName { get; init; } = "agent-hub-memory";
+    public string MemoryEmbeddingModel { get; init; } = "text-embedding-3-small";
     public required string PostgresConnectionString { get; init; }
 
     public static Settings Load(IConfiguration configuration)
@@ -25,6 +27,15 @@ public class Settings
 
         var foundryAgentName = agentHubSection["FoundryAgentName"]
             ?? configuration["AZURE_AI_FOUNDRY_AGENT_NAME"];
+
+        var memoryStoreName = agentHubSection["MemoryStoreName"]
+            ?? configuration["AZURE_AI_MEMORY_STORE_NAME"]
+            ?? "agent-hub-memory";
+
+        var memoryEmbeddingModel = agentHubSection["MemoryEmbeddingModel"]
+            ?? configuration["AZURE_AI_MEMORY_EMBEDDING_MODEL"]
+            ?? "text-embedding-3-small";
+
         var postgresConnectionString = LoadPostgresConnectionString(configuration);
 
         return new Settings
@@ -32,6 +43,8 @@ public class Settings
             AzureAIProjectEndpoint = new Uri(endpoint),
             AzureAIModelDeploymentName = modelDeploymentName,
             FoundryAgentName = foundryAgentName,
+            MemoryStoreName = memoryStoreName,
+            MemoryEmbeddingModel = memoryEmbeddingModel,
             PostgresConnectionString = postgresConnectionString
         };
     }

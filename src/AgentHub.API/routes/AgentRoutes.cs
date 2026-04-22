@@ -3,7 +3,6 @@ using AgentHub.Persistence;
 using AgentHub.SessionState;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
-using Microsoft.Extensions.Logging;
 
 namespace AgentHub.API.Routes;
 
@@ -24,6 +23,14 @@ public static class AgentRoutes
             var logger = serviceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("AgentHub.FoundryAgentRegistration");
             logger.LogInformation("Registering Foundry demo agent instance.");
             return FoundryDemoAgent.CreateAsync(settings, logger).GetAwaiter().GetResult();
+        });
+
+        services.AddSingleton(serviceProvider =>
+        {
+            var logger = serviceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("AgentHub.FoundryMemoryAgentRegistration");
+            logger.LogInformation("Registering Foundry memory agent with memory store and in-memory session cache.");
+            logger.LogDebug("Session cache: userId-keyed, thread-safe, survives app lifetime (lost on restart). Memory store: persists in Azure beyond restarts.");
+            return FoundryMemoryAgent.CreateAsync(settings, logger).GetAwaiter().GetResult();
         });
 
         return services;
@@ -121,6 +128,61 @@ public static class AgentRoutes
             return Results.Ok(new AgentRunResult(session.ConversationId, response.ToString()));
         });
 
+        app.MapPost("/agents/foundryMemoryAgent", async (
+            FoundryMemoryContext memoryContext,
+            MemoryAgentRequest request,
+            ILoggerFactory loggerFactory,
+            CancellationToken cancellationToken) =>
+        {
+            var logger = loggerFactory.CreateLogger("AgentHub.FoundryMemoryAgentRoute");
+            logger.LogInformation(
+                "Received Foundry memory agent request. UserId={UserId}, MessageLength={MessageLength}",
+                request.UserId,
+                request.Message?.Length ?? 0);
+            logger.LogDebug("Request details: Message={Message}\n[Isolation: No PostgreSQL, uses Foundry memory store + session cache]", 
+                request.Message);
+
+            if (string.IsNullOrWhiteSpace(request.Message))
+            {
+                logger.LogWarning("Foundry memory agent request rejected due to empty message. UserId={UserId}", request.UserId);
+                return Results.BadRequest("Message is required.");
+            }
+
+            if (string.IsNullOrWhiteSpace(request.UserId))
+            {
+                logger.LogWarning("Foundry memory agent request rejected due to missing userId.");
+                return Results.BadRequest("UserId is required.");
+            }
+
+            logger.LogDebug("Validation passed. UserId={UserId}, proceeding to session cache lookup", request.UserId);
+
+            var agent = memoryContext.Agent;
+            logger.LogDebug("Agent obtained from FoundryMemoryContext. AgentName={AgentName}", agent.GetType().Name);
+
+            var agentSession = await memoryContext.SessionCache.GetOrCreateSessionAsync(
+                request.UserId,
+                async () =>
+                {
+                    logger.LogDebug("Session factory invoked for UserId={UserId}, creating new AgentSession", request.UserId);
+                    return await agent.CreateSessionAsync();
+                });
+
+            logger.LogDebug("Session ready for UserId={UserId}. Cache size={CacheSize} active users", 
+                request.UserId, memoryContext.SessionCache.GetActiveCacheSize());
+
+            logger.LogDebug("Running agent with message for UserId={UserId}", request.UserId);
+            var response = await agent.RunAsync(request.Message, agentSession, cancellationToken: cancellationToken);
+            logger.LogDebug("Agent execution completed. ResponseLength={ResponseLength}", response.ToString().Length);
+
+            logger.LogInformation(
+                "Foundry memory agent response completed. UserId={UserId}, ResponseLength={ResponseLength}",
+                request.UserId,
+                response.ToString().Length);
+            logger.LogDebug("User {UserId} now has persistent context in Foundry memory store. Next request will reuse session.", request.UserId);
+
+            return Results.Ok(new MemoryAgentRunResult(request.UserId, response.ToString()));
+        });
+
         app.MapGet("/conversations/{conversationId:guid}/history", async (
             Guid conversationId,
             IConversationSessionManager sessionManager,
@@ -192,5 +254,9 @@ public static class AgentRoutes
 public record AgentRequest(string Message, Guid? ConversationId);
 
 public record AgentRunResult(Guid ConversationId, string Response);
+
+public record MemoryAgentRequest(string Message, string UserId);
+
+public record MemoryAgentRunResult(string UserId, string Response);
 
 public record ConversationHistoryResult(Guid ConversationId, IReadOnlyList<ConversationMessage> Messages);

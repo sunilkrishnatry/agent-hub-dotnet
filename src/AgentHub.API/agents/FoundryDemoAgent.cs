@@ -3,9 +3,7 @@ using System.Text.RegularExpressions;
 using Azure.AI.Projects;
 using Azure.AI.Projects.Agents;
 using Azure.Identity;
-using Microsoft.Agents.AI;
 using Microsoft.Agents.AI.Foundry;
-using Microsoft.Extensions.Logging;
 
 namespace AgentHub.API.Agents;
 

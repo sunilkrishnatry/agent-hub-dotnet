@@ -2,7 +2,6 @@ using AgentHub.API;
 using AgentHub.API.Routes;
 using AgentHub.Persistence;
 using AgentHub.SessionState;
-using Microsoft.Extensions.Logging;
 
 var builder = WebApplication.CreateBuilder(args);
 

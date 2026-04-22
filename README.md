@@ -4,20 +4,19 @@ Agent Hub is a .NET 10 minimal API for hosting AI agents using Microsoft Agent F
 
 - A code-first agent built directly from an Azure AI Foundry model deployment
 - A Foundry-managed agent created and resolved through the Foundry project
-- Conversation memory using `ConversationId`
+- A Foundry memory-backed agent that provisions a Foundry memory store
+- Conversation memory using `ConversationId` for demo and foundry-demo endpoints
 - PostgreSQL-backed conversation history persistence
 - Restart-safe conversation rehydration from stored history
 
 ## What This Project Does
 
-The API exposes agent endpoints that accept a message and an optional `ConversationId`.
+The API exposes three agent routes with two memory models.
 
-- If `ConversationId` is omitted, the API creates a new conversation
-- If `ConversationId` is provided, the API continues that conversation
-- While the app instance is running, the conversation uses an in-memory `AgentSession`
-- If the app restarts, the API reloads stored history from PostgreSQL and replays it into the next request so the conversation can continue
-
-This gives you both short-lived in-memory session continuity and restart-safe persisted memory.
+- `POST /agents/demo` and `POST /agents/foundry-demo` accept `message` plus optional `conversationId`
+- These two routes persist turns in PostgreSQL and can replay history after restart
+- `POST /agents/foundryMemoryAgent` accepts `message` plus `userId`
+- This route uses a Foundry memory store and relies on Foundry-managed memory behaviors
 
 ## Agents
 
@@ -25,6 +24,7 @@ This gives you both short-lived in-memory session continuity and restart-safe pe
 |-------|----------|------|-------------|
 | DemoAgent | `POST /agents/demo` | Code-first agent | Uses `AIProjectClient.AsAIAgent()` with runtime-defined model and instructions |
 | FoundryDemoAgent | `POST /agents/foundry-demo` | Foundry-managed agent | Uses `AgentAdministrationClient` and creates the configured Foundry agent if it does not already exist |
+| FoundryMemoryAgent | `POST /agents/foundryMemoryAgent` | Foundry-managed memory agent | Uses a Foundry memory store and a dedicated Foundry agent (`<FoundryAgentName>-memory` by default) |
 
 ## Endpoints
 
@@ -32,6 +32,7 @@ This gives you both short-lived in-memory session continuity and restart-safe pe
 |--------|-------|-------------|
 | `POST` | `/agents/demo` | Sends a message to the code-first agent |
 | `POST` | `/agents/foundry-demo` | Sends a message to the Foundry-managed agent |
+| `POST` | `/agents/foundryMemoryAgent` | Sends a message to the Foundry memory-backed agent (`message`, `userId`) |
 | `GET` | `/conversations/{conversationId}/history` | Returns persisted message history for a conversation |
 | `GET` | `/health` | Health check |
 | `GET` | `/swagger` | Swagger UI |
@@ -48,6 +49,10 @@ The solution is split into focused projects.
 
 ## Memory Model
 
+The project uses two different memory paths.
+
+### Path A: `demo` and `foundry-demo`
+
 Conversation memory is keyed by `ConversationId`.
 
 1. Client sends a message without a `ConversationId`
@@ -58,6 +63,28 @@ Conversation memory is keyed by `ConversationId`.
 6. If the app restarts, the next request with the same `ConversationId` reloads the stored history and replays it before generating the next response
 
 This means the conversation can survive process restarts as long as PostgreSQL history is available.
+
+### Path B: `foundryMemoryAgent`
+
+1. On startup, the API resolves or creates a Foundry memory store (persists in Azure)
+2. On startup, the API resolves or creates a dedicated Foundry memory agent
+3. On startup, an in-memory session cache is initialized (keyed by `userId`, thread-safe)
+4. Requests include `message` and `userId`
+5. The route checks the session cache for the `userId`:
+   - **Cache hit** — reuses the existing `AgentSession`, continuing the conversation thread
+   - **Cache miss** — creates a new `AgentSession`, caches it by `userId` for future requests
+6. Foundry's memory store reads and writes user context scoped to the `userId`
+
+**Two layers of persistence:**
+
+| Layer | Scope | Survives app restart? | Backed by |
+|-------|-------|-----------------------|-----------|
+| Session cache | In-memory per `userId` | No | RAM (thread-safe `ConcurrentDictionary`) |
+| Foundry memory store | Long-term per `userId` | **Yes** | Azure AI Foundry |
+
+When the app restarts, the session cache is cleared. However, Foundry's memory store retains long-term context (user profile, chat summaries) from all previous sessions and makes it available to the agent on the next request.
+
+This path does not use the PostgreSQL conversation pipeline.
 
 ## Prerequisites
 
@@ -83,6 +110,8 @@ The application uses the `AgentHub` configuration section.
 | `AgentHub:AzureAIProjectEndpoint` | Yes | Azure AI Foundry project endpoint |
 | `AgentHub:AzureAIModelDeploymentName` | Yes | Model deployment name in the Foundry project |
 | `AgentHub:FoundryAgentName` | No | Name of the Foundry-managed agent; defaults to `DemoAgent` when omitted |
+| `AgentHub:MemoryStoreName` | No | Foundry memory store name for `foundryMemoryAgent`; defaults to `agent-hub-memory` |
+| `AgentHub:MemoryEmbeddingModel` | No | Embedding deployment/model for Foundry memory store; defaults to `text-embedding-3-small` |
 
 ### PostgreSQL Settings
 
@@ -110,6 +139,8 @@ Environment variable fallbacks are also supported:
 - `AZURE_AI_PROJECT_ENDPOINT`
 - `AZURE_AI_MODEL_DEPLOYMENT_NAME`
 - `AZURE_AI_FOUNDRY_AGENT_NAME`
+- `AZURE_AI_MEMORY_STORE_NAME`
+- `AZURE_AI_MEMORY_EMBEDDING_MODEL`
 - `POSTGRES_CONNECTION_STRING`
 - `POSTGRES_URL`
 - `POSTGRES_HOST`
@@ -136,6 +167,8 @@ Use placeholder values similar to the following in `src/AgentHub.API/appsettings
     "AzureAIProjectEndpoint": "https://<resource>.services.ai.azure.com/api/projects/<project>",
     "AzureAIModelDeploymentName": "gpt-4o-mini",
     "FoundryAgentName": "foundry-demo-agent",
+    "MemoryStoreName": "agent-hub-memory",
+    "MemoryEmbeddingModel": "text-embedding-3-small",
     "Postgres": {
       "Host": "<server>.postgres.database.azure.com",
       "Port": "5432",
@@ -211,6 +244,14 @@ curl -X POST http://localhost:5023/agents/foundry-demo `
   -d '{"message":"What did I just ask you?","conversationId":"7f4c0cf7-f6ab-4c32-9d82-7c61d9f25a8a"}'
 ```
 
+### Call the Foundry Memory Agent
+
+```powershell
+curl -X POST http://localhost:5023/agents/foundryMemoryAgent `
+  -H "Content-Type: application/json" `
+  -d '{"message":"My favorite color is teal.","userId":"user-123"}'
+```
+
 ### Fetch Conversation History
 
 ```powershell
@@ -245,6 +286,7 @@ The API logs:
 
 - startup configuration details
 - request start and completion
+- memory store creation and resolution flow
 - agent creation flow
 - session reuse and session rehydration
 - PostgreSQL initialization and persistence errors
@@ -264,6 +306,7 @@ src/
     agents/
       DemoAgent.cs
       FoundryDemoAgent.cs
+      FoundryMemoryAgent.cs
     routes/
       AgentRoutes.cs
   AgentHub.Persistence/
