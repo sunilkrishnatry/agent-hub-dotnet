@@ -68,18 +68,22 @@ This means the conversation can survive process restarts as long as PostgreSQL h
 
 1. On startup, the API resolves or creates a Foundry memory store (persists in Azure)
 2. On startup, the API resolves or creates a dedicated Foundry memory agent
-3. On startup, an in-memory session cache is initialized (keyed by `userId`, thread-safe)
+3. On startup, an in-memory session cache and an operation cache are initialized
 4. Requests include `message` and `userId`
 5. The route checks the session cache for the `userId`:
    - **Cache hit** — reuses the existing `AgentSession`, continuing the conversation thread
    - **Cache miss** — creates a new `AgentSession`, caches it by `userId` for future requests
-6. Foundry's memory store reads and writes user context scoped to the `userId`
+6. **Search** — Before the agent runs, the route calls `SearchMemoriesAsync` using the V2 protocol to retrieve relevant memories scoped to the `userId`. Matched memories are injected as a system prompt so the agent can reference prior context.
+7. **Run** — The agent processes the user message (with or without memory context) and produces a response.
+8. **Update** — After the agent responds, the route calls `UpdateMemoriesAsync` with the user message and assistant response as separate V2 `InputItem` messages, allowing Foundry to update the user profile and chat summary.
+9. Search and update operation IDs are tracked per `userId` in the operation cache so Foundry can chain incremental updates.
 
 **Two layers of persistence:**
 
 | Layer | Scope | Survives app restart? | Backed by |
 |-------|-------|-----------------------|-----------|
 | Session cache | In-memory per `userId` | No | RAM (thread-safe `ConcurrentDictionary`) |
+| Operation cache | In-memory per `userId` | No | RAM (tracks search/update IDs for chaining) |
 | Foundry memory store | Long-term per `userId` | **Yes** | Azure AI Foundry |
 
 When the app restarts, the session cache is cleared. However, Foundry's memory store retains long-term context (user profile, chat summaries) from all previous sessions and makes it available to the agent on the next request.
@@ -92,6 +96,7 @@ This path does not use the PostgreSQL conversation pipeline.
 - An Azure AI Foundry project with a deployed model
 - Azure sign-in available to `DefaultAzureCredential` such as `az login`
 - A PostgreSQL server reachable from the API
+- For `foundryMemoryAgent`: the Foundry project's managed identity must have the **Cognitive Services OpenAI User** role on the Azure OpenAI resource hosting the `text-embedding-3-small` deployment
 
 ## Configuration
 

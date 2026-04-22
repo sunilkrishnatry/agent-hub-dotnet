@@ -114,11 +114,12 @@ sequenceDiagram
     participant Client
     participant Route as POST /agents/foundryMemoryAgent
     participant Cache as FoundryMemorySessionCache<br/>(in-memory, keyed by userId)
+    participant OpCache as FoundryMemoryOperationCache<br/>(tracks search/update IDs)
     participant Agent as AIAgent<br/>(memory-enabled Foundry agent)
-    participant MemoryStore as AIProjectMemoryStores<br/>(Foundry memory store)
+    participant MemoryAPI as AIProjectMemoryStores<br/>(V2 protocol methods)
     participant Foundry as Azure AI Foundry
 
-    Note over Cache,Foundry: Startup (once): create/resolve memory store, memory agent, and session cache
+    Note over Cache,Foundry: Startup (once): create/resolve memory store, memory agent, session cache, and operation cache
 
     Client->>Route: POST {message, userId}
 
@@ -136,13 +137,38 @@ sequenceDiagram
         Note over Cache: Cache MISS — new session created and cached
     end
 
-    Route->>Agent: RunAsync(message, agentSession)
-    Agent->>Foundry: Execute with memory-enabled agent
-    Note over MemoryStore,Foundry: Foundry reads + writes user context via memory store (scoped by userId)
-    Foundry-->>Agent: Reply
+    Note over Route,MemoryAPI: Step 1: Search Foundry memory for relevant user context
+    Route->>OpCache: GetPreviousSearchId(userId)
+    OpCache-->>Route: previousSearchId (or null)
+    Route->>MemoryAPI: SearchMemoriesAsync(storeName, V2 protocol request)
+    Note over MemoryAPI: V2 JSON: {scope, items: [{type: "message", role: "user", content: message}], previous_search_id, options}
+    MemoryAPI->>Foundry: Search memories (embedding via text-embedding-3-small)
+    Foundry-->>MemoryAPI: MemoryStoreSearchResponse (memories + searchId)
+    MemoryAPI-->>Route: matched memories
+    Route->>OpCache: RememberSearchId(userId, searchId)
+
+    Note over Route,Agent: Step 2: Run agent with optional memory-augmented prompt
+    alt memories found
+        Route->>Agent: RunAsync([system: memory context, user: message], agentSession)
+    else no memories
+        Route->>Agent: RunAsync(message, agentSession)
+    end
+    Agent->>Foundry: Execute via Foundry agent
+    Foundry-->>Agent: Response
     Agent-->>Route: AgentResponse
+
+    Note over Route,MemoryAPI: Step 3: Update Foundry memory with the conversation turn
+    Route->>OpCache: GetPreviousUpdateId(userId)
+    OpCache-->>Route: previousUpdateId (or null)
+    Route->>MemoryAPI: UpdateMemoriesAsync(storeName, V2 protocol request)
+    Note over MemoryAPI: V2 JSON: {scope, items: [{type: "message", role: "user", content: userMsg}, {type: "message", role: "assistant", content: reply}], previous_update_id, update_delay}
+    MemoryAPI->>Foundry: Update memories (user profile + chat summary)
+    Foundry-->>MemoryAPI: MemoryUpdateResult (updateId + status)
+    MemoryAPI-->>Route: update confirmed
+    Route->>OpCache: RememberUpdateId(userId, updateId)
+
     Route-->>Client: 200 OK {userId, response}
 
     Note over Cache: Session remains cached for userId (survives future requests)
-    Note over MemoryStore: Long-term user context persisted in Azure (survives app restart)
+    Note over MemoryAPI: Long-term user context persisted in Azure (survives app restart)
 ```

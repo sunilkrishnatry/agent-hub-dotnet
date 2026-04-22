@@ -1,5 +1,7 @@
 using System.ClientModel;
 using System.Collections.Concurrent;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using Azure.AI.Projects;
 using Azure.AI.Projects.Agents;
 using Azure.AI.Projects.Memory;
@@ -71,6 +73,35 @@ public sealed class FoundryMemoryContext
     public required AIProjectMemoryStores MemoryClient { get; init; }
     public required string MemoryStoreName { get; init; }
     public required FoundryMemorySessionCache SessionCache { get; init; }
+    public required FoundryMemoryOperationCache OperationCache { get; init; }
+}
+
+public sealed class FoundryMemoryOperationCache
+{
+    private readonly ConcurrentDictionary<string, string> _searchIds = new();
+    private readonly ConcurrentDictionary<string, string> _updateIds = new();
+
+    public string? GetPreviousSearchId(string scope)
+        => _searchIds.TryGetValue(scope, out var searchId) ? searchId : null;
+
+    public string? GetPreviousUpdateId(string scope)
+        => _updateIds.TryGetValue(scope, out var updateId) ? updateId : null;
+
+    public void RememberSearchId(string scope, string? searchId)
+    {
+        if (!string.IsNullOrWhiteSpace(searchId))
+        {
+            _searchIds[scope] = searchId;
+        }
+    }
+
+    public void RememberUpdateId(string scope, string? updateId)
+    {
+        if (!string.IsNullOrWhiteSpace(updateId))
+        {
+            _updateIds[scope] = updateId;
+        }
+    }
 }
 
 public static class FoundryMemoryAgent
@@ -104,6 +135,7 @@ public static class FoundryMemoryAgent
         logger.LogInformation("Foundry memory agent is ready. AgentName={AgentName}", record.Name);
 
         var sessionCache = new FoundryMemorySessionCache(logger);
+        var operationCache = new FoundryMemoryOperationCache();
         logger.LogDebug("In-memory session cache initialized (thread-safe, keyed by userId)");
 
         return new FoundryMemoryContext
@@ -111,11 +143,12 @@ public static class FoundryMemoryAgent
             Agent = client.AsAIAgent(record),
             MemoryClient = memoryClient,
             MemoryStoreName = settings.MemoryStoreName,
-            SessionCache = sessionCache
+            SessionCache = sessionCache,
+            OperationCache = operationCache
         };
     }
 
-    private static async Task<MemoryStore> GetOrCreateMemoryStoreAsync(
+    internal static async Task<MemoryStore> GetOrCreateMemoryStoreAsync(
         AIProjectMemoryStores memoryClient, Settings settings, ILogger logger)
     {
         try
@@ -146,6 +179,54 @@ public static class FoundryMemoryAgent
             logger.LogDebug("Memory store created successfully");
             return created;
         }
+    }
+
+    internal static async Task<MemoryStoreSearchResponse> SearchMemoriesAsync(
+        AIProjectMemoryStores memoryClient,
+        string memoryStoreName,
+        string scope,
+        string items,
+        string? previousSearchId,
+        CancellationToken cancellationToken)
+    {
+        var request = new MemorySearchProtocolRequest(
+            scope,
+            [new InputItemMessage("message", "user", items)],
+            previousSearchId,
+            new MemorySearchProtocolRequestOptions(5));
+
+        var result = await memoryClient.SearchMemoriesAsync(
+            memoryStoreName,
+            BinaryContent.Create(BinaryData.FromObjectAsJson(request, JsonSerializerOptions.Default)),
+            new System.ClientModel.Primitives.RequestOptions { CancellationToken = cancellationToken });
+
+        return (MemoryStoreSearchResponse)result;
+    }
+
+    internal static async Task<MemoryUpdateResult> UpdateMemoriesAsync(
+        AIProjectMemoryStores memoryClient,
+        string memoryStoreName,
+        string scope,
+        string userMessage,
+        string assistantResponse,
+        string? previousUpdateId,
+        CancellationToken cancellationToken)
+    {
+        var request = new MemoryUpdateProtocolRequest(
+            scope,
+            [
+                new InputItemMessage("message", "user", userMessage),
+                new InputItemMessage("message", "assistant", assistantResponse)
+            ],
+            previousUpdateId,
+            0);
+
+        var result = await memoryClient.UpdateMemoriesAsync(
+            memoryStoreName,
+            BinaryContent.Create(BinaryData.FromObjectAsJson(request, JsonSerializerOptions.Default)),
+            new System.ClientModel.Primitives.RequestOptions { CancellationToken = cancellationToken });
+
+        return (MemoryUpdateResult)result;
     }
 
     private static async Task<ProjectsAgentRecord> GetOrCreateAgentAsync(
@@ -179,6 +260,26 @@ public static class FoundryMemoryAgent
             return await client.AgentAdministrationClient.GetAgentAsync(agentName);
         }
     }
+
+    private sealed record InputItemMessage(
+        [property: JsonPropertyName("type")] string Type,
+        [property: JsonPropertyName("role")] string Role,
+        [property: JsonPropertyName("content")] string Content);
+
+    private sealed record MemorySearchProtocolRequest(
+        [property: JsonPropertyName("scope")] string Scope,
+        [property: JsonPropertyName("items")] InputItemMessage[] Items,
+        [property: JsonPropertyName("previous_search_id")] string? PreviousSearchId,
+        [property: JsonPropertyName("options")] MemorySearchProtocolRequestOptions Options);
+
+    private sealed record MemorySearchProtocolRequestOptions(
+        [property: JsonPropertyName("max_memories")] int MaxMemories);
+
+    private sealed record MemoryUpdateProtocolRequest(
+        [property: JsonPropertyName("scope")] string Scope,
+        [property: JsonPropertyName("items")] InputItemMessage[] Items,
+        [property: JsonPropertyName("previous_update_id")] string? PreviousUpdateId,
+        [property: JsonPropertyName("update_delay")] int UpdateDelay);
 }
 
 #pragma warning restore OPENAI001

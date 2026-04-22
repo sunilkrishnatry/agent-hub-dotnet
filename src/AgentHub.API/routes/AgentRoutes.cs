@@ -171,8 +171,40 @@ public static class AgentRoutes
                 request.UserId, memoryContext.SessionCache.GetActiveCacheSize());
 
             logger.LogDebug("Running agent with message for UserId={UserId}", request.UserId);
-            var response = await agent.RunAsync(request.Message, agentSession, cancellationToken: cancellationToken);
+            var memoryPrompt = await SearchFoundryMemoryAsync(
+                memoryContext.MemoryClient,
+                memoryContext.MemoryStoreName,
+                memoryContext.OperationCache,
+                request.UserId,
+                request.Message,
+                logger,
+                cancellationToken);
+
+            AgentResponse response;
+            if (string.IsNullOrWhiteSpace(memoryPrompt))
+            {
+                response = await agent.RunAsync(request.Message, agentSession, cancellationToken: cancellationToken);
+            }
+            else
+            {
+                var messages = new[]
+                {
+                    new ChatMessage(ChatRole.System, memoryPrompt),
+                    new ChatMessage(ChatRole.User, request.Message)
+                };
+                response = await agent.RunAsync(messages, agentSession, cancellationToken: cancellationToken);
+            }
             logger.LogDebug("Agent execution completed. ResponseLength={ResponseLength}", response.ToString().Length);
+
+            await UpdateFoundryMemoryAsync(
+                memoryContext.MemoryClient,
+                memoryContext.MemoryStoreName,
+                memoryContext.OperationCache,
+                request.UserId,
+                request.Message,
+                response.ToString(),
+                logger,
+                cancellationToken);
 
             logger.LogInformation(
                 "Foundry memory agent response completed. UserId={UserId}, ResponseLength={ResponseLength}",
@@ -236,6 +268,83 @@ public static class AgentRoutes
             agentSession,
             cancellationToken: cancellationToken);
     }
+
+#pragma warning disable AAIP001
+    private static async Task<string?> SearchFoundryMemoryAsync(
+        Azure.AI.Projects.Memory.AIProjectMemoryStores memoryClient,
+        string memoryStoreName,
+        FoundryMemoryOperationCache operationCache,
+        string? userId,
+        string message,
+        ILogger logger,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(userId))
+        {
+            return null;
+        }
+
+        var searchResponse = await FoundryMemoryAgent.SearchMemoriesAsync(
+            memoryClient,
+            memoryStoreName,
+            userId,
+            message,
+            operationCache.GetPreviousSearchId(userId),
+            cancellationToken);
+
+        operationCache.RememberSearchId(userId, searchResponse.SearchId);
+
+        var memories = searchResponse.Memories
+            .Select(memory => memory.MemoryItem?.Content)
+            .Where(content => !string.IsNullOrWhiteSpace(content))
+            .Cast<string>()
+            .ToArray();
+
+        if (memories.Length == 0)
+        {
+            logger.LogDebug("No persisted Foundry memories matched for scope={Scope}", userId);
+            return null;
+        }
+
+        logger.LogDebug("Retrieved {MemoryCount} persisted Foundry memories for scope={Scope}", memories.Length, userId);
+
+        return "Use the following persisted user memory only when it is relevant to the current request:\n" +
+               string.Join("\n", memories.Select(memory => $"- {memory}"));
+    }
+
+    private static async Task UpdateFoundryMemoryAsync(
+        Azure.AI.Projects.Memory.AIProjectMemoryStores memoryClient,
+        string memoryStoreName,
+        FoundryMemoryOperationCache operationCache,
+        string? userId,
+        string userMessage,
+        string assistantResponse,
+        ILogger logger,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(userId))
+        {
+            return;
+        }
+
+        var updateResponse = await FoundryMemoryAgent.UpdateMemoriesAsync(
+            memoryClient,
+            memoryStoreName,
+            userId,
+            userMessage,
+            assistantResponse,
+            operationCache.GetPreviousUpdateId(userId),
+            cancellationToken);
+
+        operationCache.RememberUpdateId(userId, updateResponse.UpdateId);
+        logger.LogDebug(
+            "Queued persisted Foundry memory update. Scope={Scope}, UpdateId={UpdateId}, Status={Status}, SupersededBy={SupersededBy}",
+            userId,
+            updateResponse.UpdateId,
+            updateResponse.Status,
+            updateResponse.SupersededBy);
+    }
+#pragma warning restore AAIP001
 
     private static ChatMessage ToChatMessage(ConversationMessage message)
     {
