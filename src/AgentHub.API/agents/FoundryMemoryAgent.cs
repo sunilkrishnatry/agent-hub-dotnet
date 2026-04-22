@@ -23,7 +23,7 @@ public sealed class FoundryMemorySessionCache
     private readonly ConcurrentDictionary<string, AgentSession> _sessionCache = new();
     private readonly ConcurrentDictionary<string, BoundedTurnBuffer> _turnCache = new();
     private readonly ILogger _logger;
-    private const int MaxTurnsPerUser = 10;
+    private const int MaxTurnsPerUser = 20;
 
     public FoundryMemorySessionCache(ILogger logger)
     {
