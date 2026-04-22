@@ -72,10 +72,16 @@ public sealed class LocalEmbeddingService : IDisposable
     /// </summary>
     public float[] Embed(string text)
     {
-        // Tokenize with special tokens ([CLS] ... [SEP])
-        var ids = _tokenizer.EncodeToIds(text, MaxTokens, addSpecialTokens: true,
-            out _, out _, considerPreTokenization: true, considerNormalization: true);
-        var seqLen = ids.Count;
+        try
+        {
+            var startTime = Environment.TickCount;
+            
+            // Tokenize with special tokens ([CLS] ... [SEP])
+            var ids = _tokenizer.EncodeToIds(text, MaxTokens, addSpecialTokens: true,
+                out _, out _, considerPreTokenization: true, considerNormalization: true);
+            var seqLen = ids.Count;
+            
+            _logger.LogDebug("Embedding text. TextLength={TextLength}, TokenCount={TokenCount}", text.Length, seqLen);
 
         // Build input tensors
         var inputIds = new DenseTensor<long>(seqLen);
@@ -96,18 +102,30 @@ public sealed class LocalEmbeddingService : IDisposable
             NamedOnnxValue.CreateFromTensor("token_type_ids", tokenTypeIds.Reshape([1, seqLen]))
         };
 
-        using var results = _session.Run(inputs);
+            using var results = _session.Run(inputs);
 
-        // Try direct sentence_embedding output first (some ONNX exports include it)
-        var sentenceOutput = results.FirstOrDefault(r => r.Name == "sentence_embedding");
-        if (sentenceOutput != null)
-        {
-            return Normalize(sentenceOutput.AsEnumerable<float>().ToArray());
+            // Try direct sentence_embedding output first (some ONNX exports include it)
+            var sentenceOutput = results.FirstOrDefault(r => r.Name == "sentence_embedding");
+            if (sentenceOutput != null)
+            {
+                var embedding = Normalize(sentenceOutput.AsEnumerable<float>().ToArray());
+                var elapsed = Environment.TickCount - startTime;
+                _logger.LogDebug("Embedding computation completed via sentence_embedding. ElapsedMs={ElapsedMs}", elapsed);
+                return embedding;
+            }
+
+            // Fall back to mean pooling of last_hidden_state
+            var lastHiddenState = results.First().AsTensor<float>();
+            var result = MeanPoolAndNormalize(lastHiddenState, seqLen);
+            var elapsedMs = Environment.TickCount - startTime;
+            _logger.LogDebug("Embedding computation completed via mean pooling. ElapsedMs={ElapsedMs}", elapsedMs);
+            return result;
         }
-
-        // Fall back to mean pooling of last_hidden_state
-        var lastHiddenState = results.First().AsTensor<float>();
-        return MeanPoolAndNormalize(lastHiddenState, seqLen);
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to compute embedding for text. TextLength={TextLength}", text.Length);
+            throw;
+        }
     }
 
     private static float[] MeanPoolAndNormalize(Tensor<float> lastHiddenState, int seqLen)

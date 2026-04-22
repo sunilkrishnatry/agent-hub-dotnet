@@ -8,7 +8,16 @@ var builder = WebApplication.CreateBuilder(args);
 var settings = Settings.Load(builder.Configuration);
 
 builder.Logging.ClearProviders();
-builder.Logging.AddConsole();
+builder.Logging.AddConsole(options =>
+{
+    options.FormatterName = "simple";
+});
+builder.Logging.AddSimpleConsole(options =>
+{
+    options.IncludeScopes = true;
+    options.SingleLine = false;
+    options.TimestampFormat = "yyyy-MM-dd HH:mm:ss.fff zzz ";
+});
 
 builder.Services.AddHealthChecks();
 builder.Services.AddOpenApi();

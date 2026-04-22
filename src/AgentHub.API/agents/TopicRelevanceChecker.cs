@@ -60,7 +60,20 @@ internal static partial class TopicRelevanceChecker
             {
                 var maxSimilarity = turnsWithEmbeddings
                     .Max(t => EmbeddingCosineSimilarity(queryEmbedding, t.Embedding!));
-                return maxSimilarity >= (threshold ?? DefaultEmbeddingThreshold);
+                var thresholdValue = threshold ?? DefaultEmbeddingThreshold;
+                var isOnTopic = maxSimilarity >= thresholdValue;
+                
+                // Log the decision for diagnostics
+                if (!isOnTopic)
+                {
+                    System.Diagnostics.Debug.WriteLine($"Topic shift detected. Similarity={maxSimilarity:F3}, Threshold={thresholdValue:F3}, TurnsCompared={turnsWithEmbeddings.Count}");
+                }
+                else
+                {
+                    System.Diagnostics.Debug.WriteLine($"On-topic continuation. Similarity={maxSimilarity:F3}, Threshold={thresholdValue:F3}");
+                }
+                
+                return isOnTopic;
             }
         }
 
@@ -93,12 +106,15 @@ internal static partial class TopicRelevanceChecker
             {
                 var maxSimilarity = turnsWithEmbeddings
                     .Max(t => EmbeddingCosineSimilarity(queryEmbedding, t.Embedding!));
+                System.Diagnostics.Debug.WriteLine($"Topic relevance: method=embedding, similarity={maxSimilarity:F3}, turnsCompared={turnsWithEmbeddings.Count}");
                 return (maxSimilarity, "embedding");
             }
         }
 
         // TF-IDF fallback
-        return (ComputeTfIdfSimilarity(query, recentTurns, maxTurnsToCompare), "tfidf");
+        var tfidfScore = ComputeTfIdfSimilarity(query, recentTurns, maxTurnsToCompare);
+        System.Diagnostics.Debug.WriteLine($"Topic relevance: method=tfidf, similarity={tfidfScore:F3}");
+        return (tfidfScore, "tfidf");
     }
 
     /// <summary>
@@ -135,7 +151,19 @@ internal static partial class TopicRelevanceChecker
         if (recentTokens.Count == 0)
             return false;
 
-        return TfIdfCosineSimilarity(BuildTfVector(queryTokens), BuildTfVector(recentTokens)) >= threshold;
+        var similarity = TfIdfCosineSimilarity(BuildTfVector(queryTokens), BuildTfVector(recentTokens));
+        var isOnTopic = similarity >= threshold;
+        
+        if (!isOnTopic)
+        {
+            System.Diagnostics.Debug.WriteLine($"TF-IDF topic shift detected. Similarity={similarity:F3}, Threshold={threshold:F3}, QueryTokens={queryTokens.Count}, RecentTokens={recentTokens.Count}");
+        }
+        else
+        {
+            System.Diagnostics.Debug.WriteLine($"TF-IDF on-topic continuation. Similarity={similarity:F3}, Threshold={threshold:F3}");
+        }
+        
+        return isOnTopic;
     }
 
     private static double ComputeTfIdfSimilarity(
