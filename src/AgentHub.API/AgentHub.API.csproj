@@ -7,6 +7,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="AgentHub.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Azure.AI.Extensions.OpenAI" Version="2.1.0-beta.1" />
     <PackageReference Include="Azure.AI.Projects" Version="2.1.0-beta.1" />
     <PackageReference Include="Azure.AI.Projects.Agents" Version="2.1.0-beta.1" />

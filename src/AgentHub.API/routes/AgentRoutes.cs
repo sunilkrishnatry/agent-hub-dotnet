@@ -10,7 +10,7 @@ namespace AgentHub.API.Routes;
 public static partial class AgentRoutes
 {
     [GeneratedRegex(@"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", RegexOptions.Compiled)]
-    private static partial Regex UserIdPattern();
+    internal static partial Regex UserIdPattern();
 
     public static IServiceCollection AddAgents(this IServiceCollection services, Settings settings)
     {
