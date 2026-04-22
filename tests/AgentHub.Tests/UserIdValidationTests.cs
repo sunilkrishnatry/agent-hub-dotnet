@@ -17,7 +17,6 @@ public class UserIdValidationTests
     [Theory]
     [InlineData("user@example.com")]
     [InlineData("first.last@company.org")]
-    [InlineData("name+tag@domain.co.uk")]
     [InlineData("user123@test-domain.io")]
     [InlineData("a@b.co")]
     public void UserIdPattern_ValidEmail_Matches(string userId)
@@ -26,18 +25,47 @@ public class UserIdValidationTests
     }
 
     [Theory]
+    [InlineData("jdoe")]
+    [InlineData("admin")]
+    [InlineData("user-123")]
+    [InlineData("user_123")]
+    [InlineData("user.name")]
+    [InlineData("A")]
+    [InlineData("x1234567890")]
+    public void UserIdPattern_ValidSimpleId_Matches(string userId)
+    {
+        Assert.Matches(AgentRoutes.UserIdPattern(), userId);
+    }
+
+    [Theory]
     [InlineData("")]
-    [InlineData("just-a-string")]
-    [InlineData("user@")]
-    [InlineData("@domain.com")]
-    [InlineData("not-a-guid-at-all")]
-    [InlineData("550e8400e29b41d4a716446655440000")] // GUID without hyphens
-    [InlineData("550e8400-e29b-41d4-a716")] // incomplete GUID
+    [InlineData(".startswithdot")]
+    [InlineData("-startswithyphen")]
+    [InlineData("_startsWithUnderscore")]
     [InlineData("<script>alert(1)</script>")]
     [InlineData("'; DROP TABLE users; --")]
-    [InlineData("user@domain")] // no TLD
+    [InlineData("has spaces")]
+    [InlineData("has/slash")]
+    [InlineData("has\\backslash")]
     public void UserIdPattern_InvalidFormat_DoesNotMatch(string userId)
     {
+        Assert.DoesNotMatch(AgentRoutes.UserIdPattern(), userId);
+    }
+
+    [Fact]
+    public void UserIdPattern_MaxLength128_Matches()
+    {
+        var userId = "a" + new string('b', 127);
+        Assert.Equal(128, userId.Length);
+        Assert.Matches(AgentRoutes.UserIdPattern(), userId);
+    }
+
+    [Fact]
+    public void UserIdPattern_Over128_DoesNotMatchViaRegex()
+    {
+        // The regex anchors at 128 chars (start char + up to 127 more)
+        var userId = "a" + new string('b', 128);
+        Assert.Equal(129, userId.Length);
         Assert.DoesNotMatch(AgentRoutes.UserIdPattern(), userId);
     }
 }

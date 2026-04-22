@@ -9,7 +9,7 @@ namespace AgentHub.API.Routes;
 
 public static partial class AgentRoutes
 {
-    [GeneratedRegex(@"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$|^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", RegexOptions.Compiled)]
+    [GeneratedRegex(@"^[a-zA-Z0-9][a-zA-Z0-9._%+@\-]{0,127}$", RegexOptions.Compiled)]
     internal static partial Regex UserIdPattern();
 
     public static IServiceCollection AddAgents(this IServiceCollection services, Settings settings)
@@ -167,7 +167,7 @@ public static partial class AgentRoutes
             if (request.UserId.Length > 128 || !UserIdPattern().IsMatch(request.UserId))
             {
                 logger.LogWarning("Foundry memory agent request rejected due to invalid userId format.");
-                return Results.BadRequest("UserId must be a GUID or email address (max 128 characters).");
+                return Results.BadRequest("UserId must be alphanumeric (dots, hyphens, underscores allowed), max 128 characters.");
             }
 
             logger.LogDebug("Validation passed. UserId={UserId}, proceeding to session cache lookup", request.UserId);
