@@ -13,30 +13,6 @@ public class MemoryAuditServiceTests
 {
     // ----- helpers -----
 
-    private static MemoryInspectResult InspectWith(
-        IEnumerable<MemorySearchItem> searchItems,
-        string? capturedQuery = null,
-        string userId = "user1",
-        string? topic = null)
-    {
-        string? recorded = null;
-        var auditService = new MemoryAuditService(
-            searchMemories: (scope, query, ct) =>
-            {
-                recorded = query;
-                var response = AzureAIProjectsModelFactory.MemoryStoreSearchResponse(
-                    "search-1", searchItems, usage: null);
-                return Task.FromResult(response);
-            },
-            deleteScope: (_, _) => Task.FromResult(
-                AzureAIProjectsModelFactory.MemoryStoreDeleteScopeResponse(userId, "store", isDeleted: true)),
-            sessionCache: new FoundryMemorySessionCache(NullLogger.Instance),
-            operationCache: new FoundryMemoryOperationCache(),
-            logger: NullLogger.Instance);
-
-        return auditService.InspectAsync(userId, topic, default).GetAwaiter().GetResult();
-    }
-
     private static MemorySearchItem MakeSearchItem(string content, string scope = "user1")
     {
         var json = $@"{{""memory_item"":{{""id"":""id-1"",""updated_at"":1704067200,""scope"":""{scope}"",""content"":""{content}"",""kind"":""user_profile""}}}}";
@@ -54,8 +30,6 @@ public class MemoryAuditServiceTests
                 AzureAIProjectsModelFactory.MemoryStoreSearchResponse("s1", items, null)),
             deleteScope: (_, _) => Task.FromResult(
                 AzureAIProjectsModelFactory.MemoryStoreDeleteScopeResponse("user1", "store", true)),
-            sessionCache: new FoundryMemorySessionCache(NullLogger.Instance),
-            operationCache: new FoundryMemoryOperationCache(),
             logger: NullLogger.Instance);
 
         var result = await auditService.InspectAsync("user1", null, default);
@@ -78,8 +52,6 @@ public class MemoryAuditServiceTests
             },
             deleteScope: (_, _) => Task.FromResult(
                 AzureAIProjectsModelFactory.MemoryStoreDeleteScopeResponse("user1", "store", true)),
-            sessionCache: new FoundryMemorySessionCache(NullLogger.Instance),
-            operationCache: new FoundryMemoryOperationCache(),
             logger: NullLogger.Instance);
 
         await auditService.InspectAsync("user1", topic: null, default);
@@ -99,8 +71,6 @@ public class MemoryAuditServiceTests
             },
             deleteScope: (_, _) => Task.FromResult(
                 AzureAIProjectsModelFactory.MemoryStoreDeleteScopeResponse("user1", "store", true)),
-            sessionCache: new FoundryMemorySessionCache(NullLogger.Instance),
-            operationCache: new FoundryMemoryOperationCache(),
             logger: NullLogger.Instance);
 
         await auditService.InspectAsync("user1", topic: "project preferences", default);
@@ -121,8 +91,6 @@ public class MemoryAuditServiceTests
                 AzureAIProjectsModelFactory.MemoryStoreSearchResponse("s1", items, null)),
             deleteScope: (_, _) => Task.FromResult(
                 AzureAIProjectsModelFactory.MemoryStoreDeleteScopeResponse("user1", "store", true)),
-            sessionCache: new FoundryMemorySessionCache(NullLogger.Instance),
-            operationCache: new FoundryMemoryOperationCache(),
             logger: NullLogger.Instance);
 
         var result = await auditService.InspectAsync("user1", null, default);
@@ -139,8 +107,6 @@ public class MemoryAuditServiceTests
                 AzureAIProjectsModelFactory.MemoryStoreSearchResponse("s1", [], null)),
             deleteScope: (_, _) => Task.FromResult(
                 AzureAIProjectsModelFactory.MemoryStoreDeleteScopeResponse("user1", "store", true)),
-            sessionCache: new FoundryMemorySessionCache(NullLogger.Instance),
-            operationCache: new FoundryMemoryOperationCache(),
             logger: NullLogger.Instance);
 
         var result = await auditService.InspectAsync("user1", null, default);
@@ -160,8 +126,6 @@ public class MemoryAuditServiceTests
             },
             deleteScope: (_, _) => Task.FromResult(
                 AzureAIProjectsModelFactory.MemoryStoreDeleteScopeResponse("alice", "store", true)),
-            sessionCache: new FoundryMemorySessionCache(NullLogger.Instance),
-            operationCache: new FoundryMemoryOperationCache(),
             logger: NullLogger.Instance);
 
         await auditService.InspectAsync("alice", null, default);
@@ -184,8 +148,6 @@ public class MemoryAuditServiceTests
                 return Task.FromResult(
                     AzureAIProjectsModelFactory.MemoryStoreDeleteScopeResponse(scope, "store", true));
             },
-            sessionCache: new FoundryMemorySessionCache(NullLogger.Instance),
-            operationCache: new FoundryMemoryOperationCache(),
             logger: NullLogger.Instance);
 
         await auditService.DeleteAsync("bob", default);
@@ -201,8 +163,6 @@ public class MemoryAuditServiceTests
                 AzureAIProjectsModelFactory.MemoryStoreSearchResponse("s1", [], null)),
             deleteScope: (scope, _) => Task.FromResult(
                 AzureAIProjectsModelFactory.MemoryStoreDeleteScopeResponse(scope, "store", isDeleted: true)),
-            sessionCache: new FoundryMemorySessionCache(NullLogger.Instance),
-            operationCache: new FoundryMemoryOperationCache(),
             logger: NullLogger.Instance);
 
         var result = await auditService.DeleteAsync("user1", default);
@@ -218,75 +178,10 @@ public class MemoryAuditServiceTests
                 AzureAIProjectsModelFactory.MemoryStoreSearchResponse("s1", [], null)),
             deleteScope: (scope, _) => Task.FromResult(
                 AzureAIProjectsModelFactory.MemoryStoreDeleteScopeResponse(scope, "store", isDeleted: false)),
-            sessionCache: new FoundryMemorySessionCache(NullLogger.Instance),
-            operationCache: new FoundryMemoryOperationCache(),
             logger: NullLogger.Instance);
 
         var result = await auditService.DeleteAsync("user1", default);
 
         Assert.False(result.FoundryScopeDeleted);
-    }
-
-    [Fact]
-    public async Task DeleteAsync_KnownUser_LocalCacheClearedIsTrue()
-    {
-        var sessionCache = new FoundryMemorySessionCache(NullLogger.Instance);
-        var operationCache = new FoundryMemoryOperationCache();
-
-        // Seed operation cache so ClearUser has something to remove
-        operationCache.RememberSearchId("user1", "search-1");
-        operationCache.RememberUpdateId("user1", "update-1");
-
-        var auditService = new MemoryAuditService(
-            searchMemories: (_, _, _) => Task.FromResult(
-                AzureAIProjectsModelFactory.MemoryStoreSearchResponse("s1", [], null)),
-            deleteScope: (scope, _) => Task.FromResult(
-                AzureAIProjectsModelFactory.MemoryStoreDeleteScopeResponse(scope, "store", true)),
-            sessionCache: sessionCache,
-            operationCache: operationCache,
-            logger: NullLogger.Instance);
-
-        var result = await auditService.DeleteAsync("user1", default);
-
-        Assert.True(result.LocalCacheCleared);
-    }
-
-    [Fact]
-    public async Task DeleteAsync_UnknownUser_LocalCacheClearedIsFalse()
-    {
-        var auditService = new MemoryAuditService(
-            searchMemories: (_, _, _) => Task.FromResult(
-                AzureAIProjectsModelFactory.MemoryStoreSearchResponse("s1", [], null)),
-            deleteScope: (scope, _) => Task.FromResult(
-                AzureAIProjectsModelFactory.MemoryStoreDeleteScopeResponse(scope, "store", true)),
-            sessionCache: new FoundryMemorySessionCache(NullLogger.Instance),
-            operationCache: new FoundryMemoryOperationCache(),
-            logger: NullLogger.Instance);
-
-        var result = await auditService.DeleteAsync("unknown-user", default);
-
-        Assert.False(result.LocalCacheCleared);
-    }
-
-    [Fact]
-    public async Task DeleteAsync_EvictsOperationCacheEntries()
-    {
-        var operationCache = new FoundryMemoryOperationCache();
-        operationCache.RememberSearchId("user1", "search-123");
-        operationCache.RememberUpdateId("user1", "update-456");
-
-        var auditService = new MemoryAuditService(
-            searchMemories: (_, _, _) => Task.FromResult(
-                AzureAIProjectsModelFactory.MemoryStoreSearchResponse("s1", [], null)),
-            deleteScope: (scope, _) => Task.FromResult(
-                AzureAIProjectsModelFactory.MemoryStoreDeleteScopeResponse(scope, "store", true)),
-            sessionCache: new FoundryMemorySessionCache(NullLogger.Instance),
-            operationCache: operationCache,
-            logger: NullLogger.Instance);
-
-        await auditService.DeleteAsync("user1", default);
-
-        Assert.Null(operationCache.GetPreviousSearchId("user1"));
-        Assert.Null(operationCache.GetPreviousUpdateId("user1"));
     }
 }

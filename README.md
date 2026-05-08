@@ -15,8 +15,8 @@ The API exposes three agent routes with two memory models.
 
 - `POST /agents/demo` and `POST /agents/foundry-demo` accept `message` plus optional `conversationId`
 - These two routes persist turns in PostgreSQL and can replay history after restart
-- `POST /agents/foundryMemoryAgent` accepts `message` plus `userId`
-- This route uses a Foundry memory store and relies on Foundry-managed memory behaviors
+- `POST /agents/foundryMemoryAgent` accepts `message`, `userId`, and optional `conversationId`
+- This route uses Foundry-native memory: `userId` is passed as `x-memory-user-id` for long-term memory scope, and `conversationId` controls short-term session continuity
 
 ## Agents
 
@@ -26,13 +26,22 @@ The API exposes three agent routes with two memory models.
 | FoundryDemoAgent | `POST /agents/foundry-demo` | Foundry-managed agent | Uses `AgentAdministrationClient` and creates the configured Foundry agent if it does not already exist |
 | FoundryMemoryAgent | `POST /agents/foundryMemoryAgent` | Foundry-managed memory agent | Uses a Foundry memory store and a dedicated Foundry agent (`<FoundryAgentName>-memory` by default) |
 
+### DemoAgent vs FoundryDemoAgent
+
+Both endpoints use the same request and response shape, but they differ in where the agent definition lives.
+
+- `DemoAgent` is code-first and created directly in-process with `AsAIAgent(model, instructions, name)`
+- `FoundryDemoAgent` is Foundry-managed and resolved by name using `AgentAdministrationClient`
+- `FoundryDemoAgent` validates configured names and model deployment values, and auto-creates the agent version when missing
+- `DemoAgent` is ideal for quick local demos; `FoundryDemoAgent` is better when you want a named agent managed in Foundry
+
 ## Endpoints
 
 | Method | Route | Description |
 |--------|-------|-------------|
 | `POST` | `/agents/demo` | Sends a message to the code-first agent |
 | `POST` | `/agents/foundry-demo` | Sends a message to the Foundry-managed agent |
-| `POST` | `/agents/foundryMemoryAgent` | Sends a message to the Foundry memory-backed agent (`message`, `userId`) |
+| `POST` | `/agents/foundryMemoryAgent` | Sends a message to the Foundry memory-backed agent (`message`, `userId`, optional `conversationId`) |
 | `GET` | `/conversations/{conversationId}/history` | Returns persisted message history for a conversation |
 | `GET` | `/health` | Health check |
 | `GET` | `/swagger` | Swagger UI |
@@ -69,57 +78,22 @@ This means the conversation can survive process restarts as long as PostgreSQL h
 
 1. On startup, the API resolves or creates a Foundry memory store (persists in Azure)
 2. On startup, the API resolves or creates a dedicated Foundry memory agent
-3. On startup, an in-memory session cache (with local turn buffer) and an operation cache are initialized
-4. Requests include `message` and `userId`
-5. The route computes a local embedding for the incoming message
-6. The route checks the session cache for the `userId`:
-   - **Cache hit (returning user)** — reuses the existing `AgentSession` and compares the message embedding to recent cached turns using the local `TopicRelevanceChecker` (embedding-based with TF-IDF fallback).
-     - **On-topic continuation** — uses only local turn history as context (~5-10ms topic check, **no Foundry memory search**)
-     - **Topic shift detected** — performs a `SearchMemoriesAsync` call to bootstrap long-term context from Foundry
-   - **Cache miss (first request or after restart)** — creates a new `AgentSession`, caches it, and performs a one-time `SearchMemoriesAsync` call to bootstrap long-term context from Foundry
-6. **Run** — The agent processes the user message (with local turn history or Foundry memory context) and produces a response.
-7. **Local cache with embeddings** — The user/assistant turn is appended to a bounded ring buffer (last 20 turns per user), with computed embedding vectors stored alongside for future topic detection.
-8. **Fire-and-forget update** — The route returns the response immediately, then persists the turn to Foundry memory in the background without blocking. Failures are logged but do not affect the user response.
-9. Search and update operation IDs are tracked per `userId` in the operation cache so Foundry can chain incremental updates.
+3. On startup, an in-memory session store is initialized for Foundry sessions keyed by `conversationId`
+4. Requests include `message`, `userId`, and optional `conversationId`
+5. The route sets `x-memory-user-id` to scope Foundry long-term memory to that user
+6. If the provided `conversationId` exists in the in-memory session store, that Foundry `AgentSession` is reused
+7. Otherwise, a new Foundry `AgentSession` is created, a new `conversationId` is generated, and the pair is cached
+8. The route calls `RunAsync(message, session)` directly; Foundry handles memory retrieval and persistence natively through the attached memory store
+9. The response returns `userId`, `conversationId`, and `response`
 
-**Three layers of state:**
+**State layers:**
 
 | Layer | Scope | Survives app restart? | Backed by |
 |-------|-------|-----------------------|-----------|
-| Session cache | In-memory per `userId` | No | RAM (thread-safe `ConcurrentDictionary`) |
-| Local turn buffer | In-memory per `userId`, last 20 turns with embeddings | No | RAM (bounded ring buffer + embedding vectors) |
-| Operation cache | In-memory per `userId` | No | RAM (tracks search/update IDs for chaining) |
+| Session store | In-memory per `conversationId` | No | RAM |
 | Foundry memory store | Long-term per `userId` | **Yes** | Azure AI Foundry |
 
-When the app restarts, the session cache is cleared. However, Foundry's memory store retains long-term context (user profile, chat summaries) from all previous sessions and makes it available to the agent on the next request.
-
 This path does not use the PostgreSQL conversation pipeline.
-
-## Topic Shift Detection
-
-The `foundryMemoryAgent` route includes intelligent topic shift detection to optimize memory access:
-
-**Fast path (on-topic continuation):**
-- User sends a message related to recent conversation history
-- Local `TopicRelevanceChecker` compares the message to the last 5 cached turns using semantic similarity
-- **No Foundry memory search** — uses only the fast in-memory turn buffer (~5-10ms)
-
-**Memory refresh path (topic shift detected):**
-- User sends a message unrelated to recent turns
-- Topic checker detects the shift and triggers a `SearchMemoriesAsync` call
-- Foundry memory is searched for broader context on the new topic
-- Relevant long-term context is injected before the agent generates a response
-
-**Semantic similarity engine:**
-- **Primary:** Local ONNX embedding inference using all-MiniLM-L6-v2 (~384-dim vectors, ~5-10ms per embedding)
-  - Compares message embedding against recent turn embeddings using cosine similarity (threshold 0.5)
-  - Runs entirely in-process — no network latency
-  - SIMD-optimized via `TensorPrimitives.CosineSimilarity`
-- **Fallback:** TF-IDF bag-of-words similarity (threshold 0.15)
-  - Used when local embedding model is unavailable
-  - Provides compatibility and robustness
-
-This hybrid approach balances semantic accuracy (embeddings) with reliability (TF-IDF fallback) while keeping the fast path truly local.
 
 ## Prerequisites
 
@@ -128,10 +102,6 @@ This hybrid approach balances semantic accuracy (embeddings) with reliability (T
 - Azure sign-in available to `DefaultAzureCredential` such as `az login`
 - A PostgreSQL server reachable from the API
 - For `foundryMemoryAgent`: the Foundry project's managed identity must have the **Cognitive Services OpenAI User** role on the Azure OpenAI resource hosting the `text-embedding-3-small` deployment
-- (Optional) For local topic shift detection: ONNX model files (all-MiniLM-L6-v2 or compatible)
-  - Model directory must contain `model.onnx` and `vocab.txt`
-  - Download from [HuggingFace](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2) (~80MB)
-  - If not provided, topic detection falls back to TF-IDF (slower but always available)
 
 ## Configuration
 
@@ -152,7 +122,6 @@ The application uses the `AgentHub` configuration section.
 | `AgentHub:FoundryAgentName` | No | Name of the Foundry-managed agent; defaults to `DemoAgent` when omitted |
 | `AgentHub:MemoryStoreName` | No | Foundry memory store name for `foundryMemoryAgent`; defaults to `agent-hub-memory` |
 | `AgentHub:MemoryEmbeddingModel` | No | Embedding deployment/model for Foundry memory store; defaults to `text-embedding-3-small` |
-| `AgentHub:LocalEmbeddingModelPath` | No | Path to local ONNX embedding model (for topic shift detection); if omitted, uses TF-IDF fallback |
 
 ### PostgreSQL Settings
 
@@ -182,7 +151,6 @@ Environment variable fallbacks are also supported:
 - `AZURE_AI_FOUNDRY_AGENT_NAME`
 - `AZURE_AI_MEMORY_STORE_NAME`
 - `AZURE_AI_MEMORY_EMBEDDING_MODEL`
-- `LOCAL_EMBEDDING_MODEL_PATH`
 - `POSTGRES_CONNECTION_STRING`
 - `POSTGRES_URL`
 - `POSTGRES_HOST`
@@ -211,7 +179,6 @@ Use placeholder values similar to the following in `src/AgentHub.API/appsettings
     "FoundryAgentName": "foundry-demo-agent",
     "MemoryStoreName": "agent-hub-memory",
     "MemoryEmbeddingModel": "text-embedding-3-small",
-    "LocalEmbeddingModelPath": "./models/all-MiniLM-L6-v2",
     "Postgres": {
       "Host": "<server>.postgres.database.azure.com",
       "Port": "5432",

@@ -1,5 +1,4 @@
 using System.ClientModel;
-using System.Collections.Concurrent;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Azure.AI.Projects;
@@ -14,187 +13,17 @@ namespace AgentHub.API.Agents;
 #pragma warning disable OPENAI001
 
 /// <summary>
-/// Thread-safe in-memory cache for Foundry memory agent sessions keyed by userId.
-/// Sessions are reused across requests for the same userId, enabling conversation continuity.
-/// Note: Sessions are lost on app restart; long-term user context is persisted in Foundry's memory store.
-/// </summary>
-public sealed class FoundryMemorySessionCache
-{
-    private readonly ConcurrentDictionary<string, AgentSession> _sessionCache = new();
-    private readonly ConcurrentDictionary<string, BoundedTurnBuffer> _turnCache = new();
-    private readonly ILogger _logger;
-    private const int MaxTurnsPerUser = 20;
-
-    public FoundryMemorySessionCache(ILogger logger)
-    {
-        _logger = logger;
-    }
-
-    /// <summary>
-    /// Gets an existing session for userId or creates and caches a new one.
-    /// Returns (session, isNew) so the caller knows whether a Foundry memory search is needed.
-    /// </summary>
-    public async Task<(AgentSession Session, bool IsNew)> GetOrCreateSessionAsync(string userId, Func<Task<AgentSession>> sessionFactory)
-    {
-        if (_sessionCache.TryGetValue(userId, out var cachedSession))
-        {
-            _logger.LogDebug("Reusing cached session for userId={UserId}", userId);
-            return (cachedSession, false);
-        }
-
-        _logger.LogDebug("Creating new session for userId={UserId} (not in cache)", userId);
-        var newSession = await sessionFactory();
-        var added = _sessionCache.TryAdd(userId, newSession);
-
-        if (added)
-        {
-            _logger.LogDebug("Cached new session for userId={UserId}", userId);
-        }
-        else
-        {
-            _logger.LogDebug("Race condition detected for userId={UserId}, using cached session from other thread", userId);
-            return (_sessionCache[userId], false);
-        }
-
-        return (newSession, true);
-    }
-
-    /// <summary>
-    /// Appends a user/assistant turn to the bounded local cache for the given userId.
-    /// </summary>
-    public void AppendTurn(string userId, string userMessage, string assistantResponse, float[]? embedding = null)
-    {
-        var buffer = _turnCache.GetOrAdd(userId, _ => new BoundedTurnBuffer(MaxTurnsPerUser));
-        buffer.Add(userMessage, assistantResponse, embedding);
-        _logger.LogDebug("Appended turn to local cache for userId={UserId}. TurnCount={TurnCount}", userId, buffer.Count);
-    }
-
-    /// <summary>
-    /// Returns the cached turns for the given userId (empty if no cache entry exists).
-    /// </summary>
-    public IReadOnlyList<ConversationTurn> GetTurns(string userId)
-    {
-        return _turnCache.TryGetValue(userId, out var buffer) ? buffer.GetTurns() : [];
-    }
-
-    public int GetActiveCacheSize() => _sessionCache.Count;
-
-    /// <summary>
-    /// Removes all cached session and turn data for the given userId.
-    /// Returns true if any data was present and removed.
-    /// </summary>
-    public bool ClearUser(string userId)
-    {
-        var removedSession = _sessionCache.TryRemove(userId, out _);
-        var removedTurns = _turnCache.TryRemove(userId, out _);
-        _logger.LogDebug(
-            "Cleared local session cache for userId={UserId}. SessionRemoved={SessionRemoved}, TurnsRemoved={TurnsRemoved}",
-            userId, removedSession, removedTurns);
-        return removedSession || removedTurns;
-    }
-}
-
-/// <summary>
-/// A single user/assistant exchange, optionally with a precomputed embedding for semantic comparison.
-/// </summary>
-public sealed record ConversationTurn(string UserMessage, string AssistantResponse)
-{
-    public float[]? Embedding { get; init; }
-}
-
-/// <summary>
-/// Thread-safe bounded ring buffer that keeps the most recent N turns.
-/// </summary>
-public sealed class BoundedTurnBuffer
-{
-    private readonly ConversationTurn[] _buffer;
-    private int _head;
-    private int _count;
-    private readonly object _lock = new();
-
-    public BoundedTurnBuffer(int capacity)
-    {
-        _buffer = new ConversationTurn[capacity];
-    }
-
-    public int Count { get { lock (_lock) { return _count; } } }
-
-    public void Add(string userMessage, string assistantResponse, float[]? embedding = null)
-    {
-        lock (_lock)
-        {
-            _buffer[_head] = new ConversationTurn(userMessage, assistantResponse) { Embedding = embedding };
-            _head = (_head + 1) % _buffer.Length;
-            if (_count < _buffer.Length) _count++;
-        }
-    }
-
-    public IReadOnlyList<ConversationTurn> GetTurns()
-    {
-        lock (_lock)
-        {
-            var result = new ConversationTurn[_count];
-            var start = _count < _buffer.Length ? 0 : _head;
-            for (var i = 0; i < _count; i++)
-            {
-                result[i] = _buffer[(start + i) % _buffer.Length];
-            }
-            return result;
-        }
-    }
-}
-
-/// <summary>
-/// Holds the Foundry memory agent, memory client, store name, and session cache.
+/// Holds the Foundry memory agent, memory client, store name, and session store.
 /// Registered as a singleton; the route handler injects this directly.
+/// Sessions are keyed by conversationId (short-term memory); userId is passed via
+/// the x-memory-user-id header so Foundry scopes long-term memory per user.
 /// </summary>
 public sealed class FoundryMemoryContext
 {
     public required AIAgent Agent { get; init; }
     public required AIProjectMemoryStores MemoryClient { get; init; }
     public required string MemoryStoreName { get; init; }
-    public required FoundryMemorySessionCache SessionCache { get; init; }
-    public required FoundryMemoryOperationCache OperationCache { get; init; }
-    public LocalEmbeddingService? EmbeddingService { get; init; }
-}
-
-public sealed class FoundryMemoryOperationCache
-{
-    private readonly ConcurrentDictionary<string, string> _searchIds = new();
-    private readonly ConcurrentDictionary<string, string> _updateIds = new();
-
-    public string? GetPreviousSearchId(string scope)
-        => _searchIds.TryGetValue(scope, out var searchId) ? searchId : null;
-
-    public string? GetPreviousUpdateId(string scope)
-        => _updateIds.TryGetValue(scope, out var updateId) ? updateId : null;
-
-    public void RememberSearchId(string scope, string? searchId)
-    {
-        if (!string.IsNullOrWhiteSpace(searchId))
-        {
-            _searchIds[scope] = searchId;
-        }
-    }
-
-    public void RememberUpdateId(string scope, string? updateId)
-    {
-        if (!string.IsNullOrWhiteSpace(updateId))
-        {
-            _updateIds[scope] = updateId;
-        }
-    }
-
-    /// <summary>
-    /// Removes all cached search and update IDs for the given scope (userId).
-    /// Returns true if any data was present and removed.
-    /// </summary>
-    public bool ClearUser(string scope)
-    {
-        var removedSearch = _searchIds.TryRemove(scope, out _);
-        var removedUpdate = _updateIds.TryRemove(scope, out _);
-        return removedSearch || removedUpdate;
-    }
+    public required FoundryMemorySessionStore SessionStore { get; init; }
 }
 
 public static class FoundryMemoryAgent
@@ -204,11 +33,9 @@ public static class FoundryMemoryAgent
     public static async Task<FoundryMemoryContext> CreateAsync(Settings settings, ILogger logger)
     {
         logger.LogInformation(
-            "Initializing Foundry memory agent. Endpoint={Endpoint}, MemoryStore={MemoryStore}, EmbeddingModel={EmbeddingModel}",
+            "Initializing Foundry memory agent. Endpoint={Endpoint}, MemoryStore={MemoryStore}",
             settings.AzureAIProjectEndpoint,
-            settings.MemoryStoreName,
-            settings.MemoryEmbeddingModel);
-        logger.LogDebug("Foundry memory agent configuration: isolated from PostgreSQL, userId-scoped memory, in-memory session cache");
+            settings.MemoryStoreName);
 
         var client = new AIProjectClient(settings.AzureAIProjectEndpoint, new DefaultAzureCredential());
         logger.LogDebug("AIProjectClient created with DefaultAzureCredential");
@@ -218,7 +45,6 @@ public static class FoundryMemoryAgent
 
         var memoryStore = await GetOrCreateMemoryStoreAsync(memoryClient, settings, logger);
         logger.LogInformation("Memory store ready. Name={MemoryStoreName}", memoryStore.Name);
-        logger.LogDebug("Memory store type={Type}, persistent in Azure, scoped by userId", memoryStore.GetType().Name);
 
         var agentName = settings.FoundryAgentName is not null
             ? $"{settings.FoundryAgentName}-memory"
@@ -227,20 +53,12 @@ public static class FoundryMemoryAgent
         var record = await GetOrCreateAgentAsync(client, agentName, settings, logger);
         logger.LogInformation("Foundry memory agent is ready. AgentName={AgentName}", record.Name);
 
-        var sessionCache = new FoundryMemorySessionCache(logger);
-        var operationCache = new FoundryMemoryOperationCache();
-        logger.LogDebug("In-memory session cache initialized (thread-safe, keyed by userId)");
-
-        var embeddingService = LocalEmbeddingService.TryCreate(settings.LocalEmbeddingModelPath, logger);
-
         return new FoundryMemoryContext
         {
             Agent = client.AsAIAgent(record),
             MemoryClient = memoryClient,
             MemoryStoreName = settings.MemoryStoreName,
-            SessionCache = sessionCache,
-            OperationCache = operationCache,
-            EmbeddingService = embeddingService
+            SessionStore = new FoundryMemorySessionStore()
         };
     }
 
@@ -299,32 +117,6 @@ public static class FoundryMemoryAgent
         return (MemoryStoreSearchResponse)result;
     }
 
-    internal static async Task<MemoryUpdateResult> UpdateMemoriesAsync(
-        AIProjectMemoryStores memoryClient,
-        string memoryStoreName,
-        string scope,
-        string userMessage,
-        string assistantResponse,
-        string? previousUpdateId,
-        CancellationToken cancellationToken)
-    {
-        var request = new MemoryUpdateProtocolRequest(
-            scope,
-            [
-                new InputItemMessage("message", "user", userMessage),
-                new InputItemMessage("message", "assistant", assistantResponse)
-            ],
-            previousUpdateId,
-            0);
-
-        var result = await memoryClient.UpdateMemoriesAsync(
-            memoryStoreName,
-            BinaryContent.Create(BinaryData.FromObjectAsJson(request, JsonSerializerOptions.Default)),
-            new System.ClientModel.Primitives.RequestOptions { CancellationToken = cancellationToken });
-
-        return (MemoryUpdateResult)result;
-    }
-
     private static async Task<ProjectsAgentRecord> GetOrCreateAgentAsync(
         AIProjectClient client, string agentName, Settings settings, ILogger logger)
     {
@@ -370,12 +162,6 @@ public static class FoundryMemoryAgent
 
     private sealed record MemorySearchProtocolRequestOptions(
         [property: JsonPropertyName("max_memories")] int MaxMemories);
-
-    private sealed record MemoryUpdateProtocolRequest(
-        [property: JsonPropertyName("scope")] string Scope,
-        [property: JsonPropertyName("items")] InputItemMessage[] Items,
-        [property: JsonPropertyName("previous_update_id")] string? PreviousUpdateId,
-        [property: JsonPropertyName("update_delay")] int UpdateDelay);
 }
 
 #pragma warning restore OPENAI001
